@@ -10,6 +10,7 @@ mkdir chroot
 cd chroot 
 tar xvf ../base.txz
 cd ..
+cmake .
 ./mrhcroot chroot /bin/sh
 # pkg etc
 ``` 
