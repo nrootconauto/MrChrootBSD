@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR) #The sauce is what I crave
-project(slimjail)
+project(mrchroot)
 add_executable(
-  slimjail
+  mrchroot
   main.c
   abi.c
 )
@@ -10,6 +10,6 @@ add_library(pl_hack SHARED
 )
 
 target_link_libraries(pl_hack PRIVATE dl)
-target_link_libraries(slimjail PRIVATE procstat)
-target_compile_options(slimjail PRIVATE -w)
+target_link_libraries(mrchroot PRIVATE procstat)
+target_compile_options(mrchroot PRIVATE -w)
 target_compile_options(pl_hack PRIVATE -w)
