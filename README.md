@@ -11,6 +11,7 @@ cd chroot
 tar xvf ../base.txz
 cd ..
 CC=gcc12 cmake .
+make
 ./mrhcroot chroot /bin/sh
 # pkg etc
 ``` 
