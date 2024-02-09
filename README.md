@@ -10,8 +10,9 @@ mkdir chroot
 cd chroot 
 tar xvf ../base.txz
 cd ..
-CC=gcc12 cmake .
+cmake .
 make
+cp /etc/resolv.conf /etc # networkring
 ./mrhcroot chroot /bin/sh
 # pkg etc
 ``` 

@@ -201,7 +201,7 @@ void InterceptWrite(pid_t pid,const char *str) {
 	int64_t backup_len,olen;
 	void *orig_ptr;
 	if(ABIGetArg(pid,0)==1) { //stdout
-		orig_ptr=ABIGetArg(pid,1);
+		orig_ptr=(void*)ABIGetArg(pid,1);
 		olen=ABIGetArg(pid,2);
 		ReadPTraceString(have_str,pid,orig_ptr);
 		ABISetArg(pid,2,strlen(str));
@@ -217,7 +217,7 @@ void InterceptWrite(pid_t pid,const char *str) {
 	char have_str[1024],chroot[1023]; \
 	int64_t backup_len,olen; \
 	void *orig_ptr; \
-	orig_ptr=ABIGetArg(pid,arg); \
+	orig_ptr=(void*)ABIGetArg(pid,arg); \
 	ReadPTraceString(have_str,pid,orig_ptr); \
 	GetChrootedPath(chroot,pid,have_str); \
 	backup_len=WritePTraceString(backupstr,pid,orig_ptr,chroot); \
@@ -231,7 +231,7 @@ void InterceptWrite(pid_t pid,const char *str) {
 	char have_str[1024],chroot[1023]; \
 	int64_t backup_len,olen; \
 	void *orig_ptr; \
-	orig_ptr=ABIGetArg(pid,arg); \
+	orig_ptr=(void*)ABIGetArg(pid,arg); \
 	ReadPTraceString(have_str,pid,orig_ptr); \
 	if(have_str[0]=='/') {\
 		GetChrootedPath(chroot,pid,have_str); \
@@ -249,8 +249,8 @@ void InterceptRealPathAt(pid_t pid) {
 	char have_str[1024],chroot[1023];
 	int64_t backup_len,olen;
 	void *orig_ptr,*to_ptr;
-	orig_ptr=ABIGetArg(pid,1);
-	to_ptr=ABIGetArg(pid,2);
+	orig_ptr=(void*)ABIGetArg(pid,1);
+	to_ptr=(void*)ABIGetArg(pid,2);
 	ReadPTraceString(have_str,pid,orig_ptr);
 	GetChrootedPath(chroot,pid,have_str); 
 	ptrace(PT_TO_SCX,pid,(void*)1,0);
@@ -273,9 +273,9 @@ void InterceptExecve(pid_t pid) {
 	void *orig_ptr,*argv,*env;
 	int64_t fd,args[3],bulen;
 	struct ptrace_sc_remote rmt;
-	orig_ptr=ABIGetArg(pid,0); 
-	argv=ABIGetArg(pid,1);
-	env=ABIGetArg(pid,2);
+	orig_ptr=(void*)ABIGetArg(pid,0); 
+	argv=(void*)ABIGetArg(pid,1);
+	env=(void*)ABIGetArg(pid,2);
 	ReadPTraceString(have_str,pid,orig_ptr);
 	GetChrootedPath(chroot,pid,have_str);
 	ABISetSyscall(pid,5);
@@ -285,8 +285,8 @@ void InterceptExecve(pid_t pid) {
 	waitpid(pid,NULL,0);
 	PTraceRestoreBytes(pid,orig_ptr,backup,bulen);
 	args[0]=ABIGetReturn(pid,NULL);
-	args[1]=argv;
-	args[2]=env;
+	args[1]=(int64_t)argv;
+	args[2]=(int64_t)env;
 	rmt.pscr_syscall=492;
 	rmt.pscr_nargs=3;
 	rmt.pscr_args=args;
@@ -318,7 +318,7 @@ void InterceptReadlink(pid_t pid) {
 	char new_path[1024],got_path[1024],backup[1024];
 	char rlbuf[1024];
 	int64_t backup_len,buf_len,r,trim;
-	void *orig_ptr=ABIGetArg(pid,0),*buf_ptr=ABIGetArg(pid,2);
+	void *orig_ptr=(void*)ABIGetArg(pid,0),*buf_ptr=(void*)ABIGetArg(pid,2);
 	buf_len=ABIGetArg(pid,1);
 	ReadPTraceString(got_path,pid,orig_ptr);
 	GetChrootedPath(new_path,pid,got_path);
@@ -343,7 +343,7 @@ void InterceptReadlinkAt(pid_t pid) {
 	char new_path[1024],got_path[1024],backup[1024];
 	char rlbuf[1024];
 	int64_t backup_len,buf_len=ABIGetArg(pid,3),r,trim;
-	void *orig_ptr=ABIGetArg(pid,1),*buf_ptr=ABIGetArg(pid,2);
+	void *orig_ptr=(void*)ABIGetArg(pid,1),*buf_ptr=(void*)ABIGetArg(pid,2);
 	ReadPTraceString(got_path,pid,orig_ptr);
 	if(*got_path=='/') {
 		GetChrootedPath(new_path,pid,got_path);
@@ -370,8 +370,8 @@ void InterceptReadlinkAt(pid_t pid) {
 #define INTERCEPT_FILE2(pid,arg1,arg2) \
 	char backup1[1024],chroot1[1024],got1[1024]; \
 	char backup2[1024],chroot2[1024],got2[1024]; \
-	void *orig_ptr1=ABIGetArg(pid,arg1); \
-	void *orig_ptr2=ABIGetArg(pid,arg2); \
+	void *orig_ptr1=(void*)ABIGetArg(pid,arg1); \
+	void *orig_ptr2=(void*)ABIGetArg(pid,arg2); \
 	char *dumb_ptr=orig_ptr1; /*write 2 strings to  1 pointer in case orig_ptr1/orig_ptr2 overlap(chrooted strings are larger than originals)*/  \
 	int64_t backup_len1,backup_len2; \
 	ReadPTraceString(got1,pid,orig_ptr1);  \
@@ -387,7 +387,7 @@ void InterceptReadlinkAt(pid_t pid) {
 	backup_len1=WritePTraceString(backup1,pid,orig_ptr1,chroot1); \
 	dumb_ptr+=backup_len1; \
 	backup_len2=WritePTraceString(backup2,pid,dumb_ptr,chroot2); \
-	ABISetArg(pid,1,dumb_ptr); /*Re-assign poo poo address*/ \
+	ABISetArg(pid,1,(int64_t)dumb_ptr); /*Re-assign poo poo address*/ \
 	ptrace(PT_TO_SCX,pid,(void*)1,0); \
 	waitpid(pid,NULL,0);  \
 	PTraceRestoreBytes(pid,orig_ptr1,backup1,backup_len1); \
@@ -413,7 +413,7 @@ void InterceptChdir(pid_t pid) {
 	char have_str[1024],chroot[1023];
 	int64_t backup_len,olen;
 	void *orig_ptr;
-	orig_ptr=ABIGetArg(pid,0);
+	orig_ptr=(void*)ABIGetArg(pid,0);
 	ReadPTraceString(have_str,pid,orig_ptr);
 	GetChrootedPath(chroot,pid,have_str);
 	backup_len=WritePTraceString(backupstr,pid,orig_ptr,chroot);
@@ -427,7 +427,7 @@ void Intercept__Getcwd(pid_t pid) {
 	void *orig_ptr;
 	char cwd[1024];
 	olen=GetProcCwd(cwd,pid);
-	orig_ptr=ABIGetArg(pid,0);
+	orig_ptr=(void*)ABIGetArg(pid,0);
 	cap=ABIGetArg(pid,1);
 	ptrace(PT_TO_SCX,pid,(void*)1,0);
 	waitpid(pid,NULL,0);
@@ -460,7 +460,7 @@ struct stat;
 
 void InterceptFstat(pid_t pid) {
 	//makes the file look like it was made by root (TODO enable/disable this from command line)
-	char *ptr=ABIGetArg(pid,1);
+	char *ptr=(void*)ABIGetArg(pid,1);
 	int64_t o1=offsetof(struct stat,st_uid),o2=offsetof(struct stat,st_gid);
 	ptrace(PT_TO_SCX,pid,(void*)1,0);
 	waitpid(pid,NULL,0);
@@ -470,7 +470,7 @@ void InterceptFstat(pid_t pid) {
 
 void InterceptFhstat(pid_t pid) {
 	//makes the file look like it was made by root (TODO enable/disable this from command line)
-	char *ptr=ABIGetArg(pid,1);
+	char *ptr=(void*)ABIGetArg(pid,1);
 	int64_t o1=offsetof(struct stat,st_uid),o2=offsetof(struct stat,st_gid);
 	ptrace(PT_TO_SCX,pid,(void*)1,0);
 	waitpid(pid,NULL,0);
@@ -480,7 +480,7 @@ void InterceptFhstat(pid_t pid) {
 
 void InterceptFstatat(pid_t pid) {
 	//makes the file look like it was made by root (TODO enable/disable this from command line)
-	char *statp=ABIGetArg(pid,2);
+	char *statp=(void*)ABIGetArg(pid,2);
 	int64_t o1=offsetof(struct stat,st_uid),o2=offsetof(struct stat,st_gid);
 	INTERCEPT_FILE1_ONLY_ABS(pid,1);
 	ptrace(PT_WRITE_D,pid,statp+o1,0);
