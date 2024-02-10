@@ -382,12 +382,11 @@ void InterceptExecve(pid_t pid) {
 		for(fd=0;fd!=extra_args;fd++) {
 			PTraceWritePtr(pid,argv+fd,extra_arg_ptrs[fd]);
 			ReadPTraceString(have_str,pid,extra_arg_ptrs[fd]);
-			puts(have_str);
 		}
 		
 		
 		//The first argument to the argv is the program name,but we delegated it to the interrepter
-		//REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY(we put in the full path already )
+		//REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY
 		while(PTraceReadPtr(pid,argv+fd)) {
 			PTraceWritePtr(pid,argv+fd,PTraceReadPtr(pid,argv+fd+1));
 			fd++;
