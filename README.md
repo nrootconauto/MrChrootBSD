@@ -5,7 +5,7 @@
 This is early in development so stay tuned.
 
 ```sh
-wget https://download.freebsd.org/releases/amd64/13.2-RELEASE/base.txz
+wget https://download.freebsd.org/releases/amd64/14.0-RELEASE/base.txz
 mkdir chroot
 cd chroot 
 tar xvf ../base.txz

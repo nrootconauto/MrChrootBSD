@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <kvm.h>
 #include <sys/param.h>
@@ -268,29 +269,138 @@ void InterceptOpen(pid_t pid) {
 	INTERCEPT_FILE1(pid,0);
 }
 
+static int64_t IsMagicFile(char *chrooted_name,char *prog_name_to) {
+	if(access(chrooted_name,F_OK))
+	  return 0;
+	char buf[1024],*ptr;
+	int64_t l;
+	FILE *f=fopen(chrooted_name,"rb");
+	l=fread(buf,1,1023,f);
+	fclose(f);
+	if(l>=0)
+	  buf[l]=0;
+	if(!strncmp(buf,"#!",2)) {
+		if(!strchr(buf,'\n'))
+		  return 0;
+		*strchr(buf,'\n')=0;
+		if(prog_name_to) strcpy(prog_name_to,buf+2);
+		return 1;
+	}
+	return 0;
+}
+
+static char *SkipWhitespace(char *p) {
+	while(*p&&isblank(*p))
+	  p++;
+	return p;
+}
+void *PTraceReadPtr(pid_t pid,char *at) {
+	uint64_t ptr=((uint64_t)ptrace(PT_READ_D,pid,at,0))&0xffFFffFFul;
+	ptr|=(uint64_t)ptrace(PT_READ_D,pid,at+4,0)<<32ul;
+	return (void*)ptr;
+}
+
+void *PTraceWritePtr(pid_t pid,void *at,void *ptr) {
+	ptrace(PT_WRITE_D,pid,at,((uint64_t)ptr)&0xffFFffFFul);
+	ptrace(PT_WRITE_D,pid,(char*)at+4,((uint64_t)ptr)>>32ul);
+	return ptr;
+}
+
 void InterceptExecve(pid_t pid) {
-	char have_str[1024],chroot[1024],backup[1024];
-	void *orig_ptr,*argv,*env;
-	int64_t fd,args[3],bulen;
+	char have_str[1024],chroot[1024],backup[1024],poop_ant[1024];
+	char *orig_ptr,**argv,**env;
+	char *ptr,*ptr2,*command,*argument;
+	int64_t fd,args[3],bulen,extra_args=0;
 	struct ptrace_sc_remote rmt;
 	orig_ptr=(void*)ABIGetArg(pid,0); 
 	argv=(void*)ABIGetArg(pid,1);
 	env=(void*)ABIGetArg(pid,2);
 	ReadPTraceString(have_str,pid,orig_ptr);
 	GetChrootedPath(chroot,pid,have_str);
-	ABISetSyscall(pid,5);
-	ABISetArg(pid,1,O_EXEC);
-	bulen=WritePTraceString(backup,pid,orig_ptr,chroot);
-	ptrace(PT_TO_SCX,pid,(void*)1,0);
-	waitpid(pid,NULL,0);
-	PTraceRestoreBytes(pid,orig_ptr,backup,bulen);
-	args[0]=ABIGetReturn(pid,NULL);
-	args[1]=(int64_t)argv;
-	args[2]=(int64_t)env;
-	rmt.pscr_syscall=492;
-	rmt.pscr_nargs=3;
-	rmt.pscr_args=args;
-	ptrace(PT_SC_REMOTE,pid,&rmt,sizeof(rmt));
+	memset(poop_ant,0,sizeof(poop_ant));
+	if(!IsMagicFile(chroot,poop_ant)) {
+		//fexeve(open(poopy,O_EXEC),argv,env)
+		ABISetSyscall(pid,5);
+		ABISetArg(pid,1,O_EXEC);
+		bulen=WritePTraceString(backup,pid,orig_ptr,chroot);
+		ptrace(PT_TO_SCX,pid,(void*)1,0);
+		waitpid(pid,NULL,0);
+		PTraceRestoreBytes(pid,orig_ptr,backup,bulen);
+		args[0]=ABIGetReturn(pid,NULL);
+		args[1]=(int64_t)argv;
+		args[2]=(int64_t)env;
+		rmt.pscr_syscall=492;
+		rmt.pscr_nargs=3;
+		rmt.pscr_args=args;
+		ptrace(PT_SC_REMOTE,pid,&rmt,sizeof(rmt));
+	} else {
+		char *extra_arg_ptrs[256];
+		//fexecve(open("interrepret name"),argv,env)
+		command=SkipWhitespace(poop_ant);
+		ptr2=command;
+		while(*ptr2&&!isblank(*ptr2))
+			ptr2++;
+		*ptr2++=0;
+		GetChrootedPath(chroot,pid,command);
+		ABISetSyscall(pid,5);
+		ABISetArg(pid,1,O_EXEC);
+		bulen=WritePTraceString(backup,pid,orig_ptr,chroot);
+		ptrace(PT_TO_SCX,pid,(void*)1,0);
+		waitpid(pid,NULL,0);
+		
+		PTraceRestoreBytes(pid,orig_ptr,backup,bulen);	
+		//Insert the pointer to the command name before argv(I will dump the name to NULL,it doesnt matter as we will change the program image at fexecve)
+		ptr=orig_ptr-0x10000;
+		extra_args=0;
+		WritePTraceString(NULL,pid,ptr,command);
+		extra_arg_ptrs[extra_args++]=ptr;
+		ptr+=strlen(command)+1;
+		while(*ptr2) {
+			ptr2=SkipWhitespace(ptr2);
+			argument=ptr2;
+			while(*ptr2&&!isblank(*ptr2))
+				ptr2++;
+			*ptr2++=0;
+			extra_arg_ptrs[extra_args++]=ptr;
+			WritePTraceString(NULL,pid,ptr,argument);
+			ptr+=strlen(argument)+1;
+		}
+		
+		// IF we have '#! /bin/tcsh -xv' in ./poop.sh, do
+		//argv[0] = bin/tcsh
+		//argv[1] = -xv
+		//argv[2] = ./poop.s
+		//argv[...] = ...
+		
+		//Put command name here
+		WritePTraceString(NULL,pid,ptr,have_str);
+		extra_arg_ptrs[extra_args++]=ptr;
+		ptr+=strlen(have_str)+1;
+		
+		argv-=extra_args;
+		
+		for(fd=0;fd!=extra_args;fd++) {
+			PTraceWritePtr(pid,argv+fd,extra_arg_ptrs[fd]);
+			ReadPTraceString(have_str,pid,extra_arg_ptrs[fd]);
+			puts(have_str);
+		}
+		
+		
+		//The first argument to the argv is the program name,but we delegated it to the interrepter
+		//REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY(we put in the full path already )
+		while(PTraceReadPtr(pid,argv+fd)) {
+			PTraceWritePtr(pid,argv+fd,PTraceReadPtr(pid,argv+fd+1));
+			fd++;
+		}
+		
+		args[0]=ABIGetReturn(pid,NULL);
+		args[1]=(int64_t)argv;	
+		args[2]=(int64_t)env;
+		rmt.pscr_syscall=492;
+		rmt.pscr_nargs=3;
+		rmt.pscr_args=args;
+		ptrace(PT_SC_REMOTE,pid,&rmt,sizeof(rmt));
+	}
 }
 
 int64_t UnChrootPath(char *to,char *from) {
@@ -797,16 +907,20 @@ normal:
 					case 483: //shm_unlink
 					InterceptAccessShmUnlink(pid2);
 					break;
+					break;
 					case 500: //readlinkat
 					InterceptReadlinkAt(pid2);
 					break;
 					case 489 ... 499: //openat xxx_at
 					case 503:
 					{
-						INTERCEPT_FILE1_ONLY_ABS(pid2,1); //This exits the syscall for us
-						//TODO check if "root"
-						if(inf.pl_syscall_code==490||inf.pl_syscall_code==491)
-							ABISetReturn(pid2,0,0);
+						if(inf.pl_syscall_code==492) {
+						} else {
+							INTERCEPT_FILE1_ONLY_ABS(pid2,1); //This exits the syscall for us
+							//TODO check if "root"
+							if(inf.pl_syscall_code==490||inf.pl_syscall_code==491)
+								ABISetReturn(pid2,0,0);
+						}
 					}
 					break;
 					case 501: { //renameat
