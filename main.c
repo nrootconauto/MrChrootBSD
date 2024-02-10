@@ -809,6 +809,78 @@ normal:
 							ABISetReturn(pid2,0,0);
 					}
 					break;
+					case 501: { //renameat
+						pid_t pid=pid2;
+						char backupstr[1024],backupstr2[1024];
+						char have_str[1024],chroot[1023],have_str2[1024],chroot2[1024];
+						int64_t backup_len=-1,backup_len2=-1;
+						char *orig_ptr,*orig_ptr2,*dumb_to;
+						orig_ptr=(void*)ABIGetArg(pid,1);
+						orig_ptr2=(void*)ABIGetArg(pid,3);
+						ReadPTraceString(have_str,pid,orig_ptr);
+						ReadPTraceString(have_str2,pid,orig_ptr2);
+						dumb_to=orig_ptr2;
+						if(have_str[0]=='/') {
+							GetChrootedPath(chroot,pid,have_str);
+							backup_len=WritePTraceString(backupstr,pid,orig_ptr,chroot);
+							dumb_to=orig_ptr+backup_len+1;
+						} else {
+							dumb_to=orig_ptr+strlen(have_str)+1;
+						} 
+						
+						//orig_ptr[0]orig_ptr's string
+						if(have_str2[0]=='/') {
+							GetChrootedPath(chroot2,pid,have_str2);
+							backup_len2=WritePTraceString(backupstr2,pid,dumb_to,chroot2);
+						} else 
+							backup_len2=WritePTraceString(backupstr2,pid,dumb_to,have_str2);
+						ABISetArg(pid,3,(uint64_t)dumb_to);
+						
+						ptrace(PT_TO_SCX,pid,(void*)1,0);
+						waitpid(pid,NULL,0);
+						
+						if(backup_len!=-1)
+						  PTraceRestoreBytes(pid,orig_ptr,backupstr,backup_len);
+						if(backup_len2!=-1)
+						  PTraceRestoreBytes(pid,dumb_to,backupstr2,backup_len2);
+					}
+					break;
+					case 502: { //symlinkat
+						pid_t pid=pid2;
+						char backupstr[1024],backupstr2[1024];
+						char have_str[1024],chroot[1023],have_str2[1024],chroot2[1024];
+						int64_t backup_len=-1,backup_len2=-1;
+						char *orig_ptr,*orig_ptr2,*dumb_to;
+						orig_ptr=(void*)ABIGetArg(pid,0);
+						orig_ptr2=(void*)ABIGetArg(pid,2);
+						ReadPTraceString(have_str,pid,orig_ptr);
+						ReadPTraceString(have_str2,pid,orig_ptr2);
+						dumb_to=orig_ptr2;
+						if(have_str[0]=='/') {
+							GetChrootedPath(chroot,pid,have_str);
+							backup_len=WritePTraceString(backupstr,pid,orig_ptr,chroot);
+							dumb_to=orig_ptr+backup_len+1;
+						} else {
+							dumb_to=orig_ptr+strlen(have_str)+1;
+						} 
+						//orig_ptr[0]orig_ptr's string
+						if(have_str2[0]=='/') {
+							GetChrootedPath(chroot2,pid,have_str2);
+							backup_len2=WritePTraceString(backupstr2,pid,dumb_to,chroot2);
+						} else 
+							backup_len2=WritePTraceString(backupstr2,pid,dumb_to,have_str2);
+						ABISetArg(pid,2,(uint64_t)dumb_to);
+						
+						
+						ptrace(PT_TO_SCX,pid,(void*)1,0);
+						waitpid(pid,NULL,0);
+						
+						if(backup_len!=-1)
+						  PTraceRestoreBytes(pid,orig_ptr,backupstr,backup_len);
+						if(backup_len2!=-1)
+						  PTraceRestoreBytes(pid,dumb_to,backupstr2,backup_len2);
+					}
+					break;
 					case 506 ... 508: //jail shit. TODO
 					break;
 					case 551: //fstat
