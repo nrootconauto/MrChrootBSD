@@ -741,6 +741,17 @@ normal:
 						FakeGroup(pid2);
 					}
 					break;
+					case 49: {//getlogin
+						//TODO check for root spoofing
+						char *who="root";
+						int64_t len=ABIGetArg(pid2,1);
+						char *to=(char*)ABIGetArg(pid2,0);
+						ptrace(PT_TO_SCX,pid2,(void*)1,0);
+						if(to) {
+							WritePTraceString(NULL,pid2,to,who);
+						}
+					}
+					break;
 					case 54: //ioctl
 					break;
 					case 56: {//revoke
