@@ -19,8 +19,6 @@ cp /etc/resolv.conf /etc # networkring
 ## Things to do after chroot'ing
 ### Copy `/etc/resolv.conf` into `/etc`.
   You'll want to do this for networking
-### Do `ldconfig /lib /usr/local/lib`
-  Use some defacto libraries you can install via pkg
 ## How it works internally
 It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
 
