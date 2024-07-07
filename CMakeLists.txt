@@ -1,15 +1,21 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR) #The sauce is what I crave
-project(mrchroot)
-add_executable(
-  mrchroot
+project(mrchroot
+  LANGUAGES C)
+add_executable(${PROJECT_NAME}
   main.c
-  abi.c
-)
+  abi.c)
+set_target_properties(${PROJECT_NAME}
+  PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS YES
+    C_VISIBILITY_PRESET hidden)
 add_library(pl_hack SHARED
-	preload_hack.c
-)
+  preload_hack.c)
 
 target_link_libraries(pl_hack PRIVATE dl)
 target_link_libraries(mrchroot PRIVATE procstat)
-target_compile_options(mrchroot PRIVATE -w)
-target_compile_options(pl_hack PRIVATE -w)
+
+set(FLAGS -Wall -Wextra -fno-stack-protector -fno-strict-aliasing)
+target_compile_options(mrchroot PRIVATE ${FLAGS})
+target_compile_options(pl_hack PRIVATE ${FLAGS})
