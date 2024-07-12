@@ -8,6 +8,7 @@
 /* clang-format on */
 
 #include "abi.h"
+#include "ptrace.h"
 
 #ifdef __x86_64__
 #define Ones(x) ((1ul << x) - 1) // Ones(4) -> 0xF (0b1111)
@@ -59,15 +60,8 @@ int64_t ABIGetArg(pid_t pid, int64_t arg) {
     return *(int64_t *)((char *)&regs + abi_off[arg]);
   else {
     int64_t ret;
-    uintptr_t rsp = regs.r_rsp;
-    struct ptrace_io_desc iod = {
-        .piod_op = PIOD_READ_D,
-        .piod_offs = &((int64_t *)rsp)[arg - 6],
-        .piod_addr = &ret,
-        .piod_len = 8,
-    };
-    ptrace(PT_IO, pid, (caddr_t)&iod, 0);
-    assert(iod.piod_len == 8);
+    uintptr_t argp = regs.r_rsp + 8 * (arg - 6);
+    assert(8 == PTraceRead(pid, &ret, (void *)argp, 8));
     return ret;
   }
 }
@@ -79,15 +73,8 @@ void ABISetArg(pid_t pid, int64_t arg, uint64_t val) {
     *(uint64_t *)((char *)&regs + abi_off[arg]) = val;
     Setregs(pid, &regs);
   } else {
-    uintptr_t rsp = regs.r_rsp;
-    struct ptrace_io_desc iod = {
-        .piod_op = PIOD_WRITE_D,
-        .piod_offs = &((int64_t *)rsp)[arg - 6],
-        .piod_addr = &val,
-        .piod_len = 8,
-    };
-    ptrace(PT_IO, pid, (caddr_t)&iod, 0);
-    assert(iod.piod_len == 8);
+    uintptr_t argp = regs.r_rsp + 8 * (arg - 6);
+    assert(8 == PTraceWrite(pid, (void *)argp, &val, 8));
   }
 }
 #else

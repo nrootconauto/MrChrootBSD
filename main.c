@@ -1,7 +1,11 @@
 #include "abi.h"
+#include "ptrace.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,30 +32,30 @@ class (CMountPoint) {
 } mount_head, *root_mount;
 
 class (CProcInfo) {
-  struct CProcInfo *last, *next;
+  CProcInfo *last, *next;
   pid_t pid;
 } proc_head;
 
 /* clang-format on */
+#define declval(T) (*(T *)0ul)
 
 // TODO account for pid(chroot/jail etc)
 static int64_t UnChrootPath(char *to, char *from);
 
-int64_t GetProcCwd(char *to, pid_t pid) {
-  unsigned int cnt = 0, idx;
+static int64_t GetProcCwd(char *to, pid_t pid) {
+  unsigned cnt = 0;
   int64_t res_cnt = 0;
   char buf[1024];
   struct procstat *ps = procstat_open_sysctl();
   struct filestat_list *head;
   // See /usr/src/use.bin/procstat in FreeBSD
-  struct filestat *thank_the_devas;
+  struct filestat *fs;
   struct kinfo_proc *kprocs = procstat_getprocs(ps, KERN_PROC_PID, pid, &cnt);
-  for (idx = 0; idx != cnt; idx++) {
+  for (unsigned i = 0; i < cnt; i++) {
     head = procstat_getfiles(ps, kprocs, 0);
-    STAILQ_FOREACH(thank_the_devas, head, next) {
-      if (thank_the_devas->fs_path &&
-          thank_the_devas->fs_uflags & PS_FST_UFLAG_CDIR) {
-        res_cnt = UnChrootPath(buf, thank_the_devas->fs_path);
+    STAILQ_FOREACH(fs, head, next) {
+      if (fs->fs_path && fs->fs_uflags & PS_FST_UFLAG_CDIR) {
+        res_cnt = UnChrootPath(buf, fs->fs_path);
         if (to)
           strcpy(to, buf);
         break;
@@ -60,12 +64,11 @@ int64_t GetProcCwd(char *to, pid_t pid) {
     procstat_freefiles(ps, head);
   }
   procstat_freeprocs(ps, kprocs);
-  procstat_close(ps);
   return res_cnt;
 }
 
-CMountPoint *AddMountPoint(const char *dst, const char *src) {
-  CMountPoint *mp = calloc(sizeof(CMountPoint), 1);
+static CMountPoint *AddMountPoint(const char *dst, const char *src) {
+  CMountPoint *mp = malloc(sizeof *mp);
   strcpy(mp->src_path, src);
   realpath(dst, mp->dst_path);
   mp->next = mount_head.next;
@@ -75,7 +78,7 @@ CMountPoint *AddMountPoint(const char *dst, const char *src) {
   return mp;
 }
 
-CProcInfo *GetProcInfByPid(pid_t pid) {
+static CProcInfo *GetProcInfByPid(pid_t pid) {
   CProcInfo *cur;
   for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
     if (pid == cur->pid)
@@ -86,15 +89,17 @@ CProcInfo *GetProcInfByPid(pid_t pid) {
       .last = &proc_head,
       .pid = pid,
   };
-  return cur->last->next //
-       = cur->next->last //
-       = cur;
+  return cur->last->next   //
+         = cur->next->last //
+         = cur;
 }
+
 static char *StrMove(char *to, char *from) {
   int64_t len = strlen(from) + 1;
   return memmove(to, from, len);
 }
-int64_t NormailizePath(char *to, const char *path) {
+
+static int64_t NormailizePath(char *to, const char *path) {
   int64_t idx;
   char result[1024];
   strcpy(result, path);
@@ -118,14 +123,16 @@ int64_t NormailizePath(char *to, const char *path) {
     strcpy(to, result);
   return strlen(result);
 }
-int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
-  int64_t idx, max_match = 0;
+
+static int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
+  int64_t idx;
+  size_t max_match = 0;
   char result[1024];
-  char certified_lover_boy[1024];
-  CProcInfo *pi = GetProcInfByPid(pid);
+  char s[1024], *cur = s;
+  // CProcInfo *pi = GetProcInfByPid(pid);
   CMountPoint *mp, *choose;
   struct ptrace_lwpinfo inf;
-  ptrace(PT_LWPINFO, pid, &inf, sizeof(inf));
+  ptrace(PT_LWPINFO, pid, (caddr_t)&inf, sizeof inf);
   if (*path == '/')
     strcpy(result, "/");
   else {
@@ -150,95 +157,72 @@ int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
     exit(1);
   }
   mp = choose;
-  strcpy(certified_lover_boy, mp->dst_path);
-  strcat(certified_lover_boy, "/");
-  strcat(certified_lover_boy, &result[strlen(mp->src_path)]);
-  NormailizePath(certified_lover_boy, certified_lover_boy);
-  idx = strlen(certified_lover_boy);
+  cur = stpcpy(cur, mp->dst_path);
+  *cur++ = '/';
+  cur = stpcpy(cur, result + strlen(mp->src_path));
+  NormailizePath(s, s);
+  idx = strlen(s);
   if (idx)
-    if (certified_lover_boy[idx - 1] == '/')
-      certified_lover_boy[idx - 1] = 0;
+    if (s[idx - 1] == '/')
+      s[idx - 1] = 0;
   if (to)
-    strcpy(to, certified_lover_boy);
-  return strlen(certified_lover_boy);
+    strcpy(to, s);
+  return strlen(s);
 }
-int64_t ReadPTraceString(char *to, pid_t pid, const int *pt_ptr) {
-  int64_t idx, nul_check;
-  char result[1024];
-  for (idx = 0; idx != sizeof(result) / sizeof(int); idx++) {
-    ((int *)result)[idx] = ptrace(PT_READ_D, pid, pt_ptr, 0);
-    for (nul_check = 0; nul_check != sizeof(int); nul_check++) {
-      if (!result[nul_check + idx * sizeof(int)])
-        goto pass;
+
+static ptrdiff_t ReadPTraceString(char *to, pid_t pid, char *pt_ptr) {
+  char *al_ptr = (char *)((uintptr_t)(pt_ptr + 255) & -256), *cur, *nul;
+  size_t ret = 0;
+  ptrdiff_t diff;
+  if ((diff = al_ptr - pt_ptr)) {
+    char buf[diff];
+    assert(PTraceRead(pid, buf, pt_ptr, diff) == (size_t)diff);
+    if ((nul = memchr(buf, 0, diff))) {
+      memcpy(to, buf, nul - buf + 1);
+      return nul - buf;
     }
-    pt_ptr++;
+    memcpy(to, buf, diff);
+    ret += diff;
+    to += diff;
   }
-  if (to)
-    strcpy(to, "");
-  return 0;
-pass:
-  if (to)
-    strcpy(to, result);
-  return (idx + 1) * sizeof(int);
-}
-void PTraceRestoreBytes(pid_t pid, int *pt_ptr, const int *backup,
-                        int64_t backup_len) {
-  int64_t ints = backup_len / sizeof(int), idx;
-  for (idx = 0; idx != ints; idx++) {
-    ptrace(PT_WRITE_D, pid, pt_ptr++, backup[idx]);
-  }
-}
-void PTraceWriteBytes(pid_t pid, const int *pt_ptr, const char *st,
-                      int64_t len) {
-  int64_t ints = (len + 1) / sizeof(int);
-  int64_t have, mask, idx;
-  for (idx = 0; idx != ints; idx++) {
-    ptrace(PT_WRITE_D, pid, pt_ptr++, ((const int *)st)[idx]);
-  }
-  len = len % sizeof(int);
-  if (len) {
-    mask = (1ul << (len * 8)) - 1;
-    have = (ptrace(PT_READ_D, pid, pt_ptr, 0) & ~mask) |
-           (((const int *)st)[idx] & mask);
-    ptrace(PT_WRITE_D, pid, pt_ptr, have);
+  cur = al_ptr;
+  char s[256];
+  size_t readb;
+  while (true) {
+    readb = PTraceRead(pid, s, cur, 256);
+    if ((nul = memchr(s, 0, readb))) {
+      memcpy(to, s, nul - s + 1);
+      return ret + nul - s;
+    }
+    to += readb;
+    cur += readb;
+    ret += readb;
   }
 }
-int64_t WritePTraceString(int *backup, pid_t pid, const int *pt_ptr,
-                          const char *st) {
-  int64_t idx;
-  int64_t ints = (strlen(st) + 1) / sizeof(int);
-  if ((strlen(st) + 1) % sizeof(int))
-    ints++;
-  for (idx = 0; idx != ints; idx++) {
-    if (backup)
-      backup[idx] = ptrace(PT_READ_D, pid, pt_ptr, 0);
-    ptrace(PT_WRITE_D, pid, pt_ptr, ((const int *)st)[idx]);
-    pt_ptr++;
-  }
-  return ints * sizeof(int);
+
+static void PTraceRestoreBytes(pid_t pid, void *pt_ptr, void *backup,
+                               size_t len) {
+  assert(PTraceWrite(pid, pt_ptr, backup, len) == len);
 }
-void InterceptWrite(pid_t pid, const char *str) {
-  return;
-  char backupstr[1024];
-  char have_str[1024];
-  int64_t backup_len, olen;
-  void *orig_ptr;
-  if (ABIGetArg(pid, 0) == 1) { // stdout
-    orig_ptr = (void *)ABIGetArg(pid, 1);
-    olen = ABIGetArg(pid, 2);
-    ReadPTraceString(have_str, pid, orig_ptr);
-    ABISetArg(pid, 2, strlen(str));
-    backup_len = WritePTraceString(backupstr, pid, orig_ptr, str);
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);
-    waitpid(pid, NULL, 0);
-    PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);
-    ABISetReturn(pid, olen, 0);
-  }
+
+static void PTraceWriteBytes(pid_t pid, void *pt_ptr, const void *st,
+                             size_t len) {
+  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
 }
+
+static size_t WritePTraceString(void *backup, pid_t pid, void *pt_ptr,
+                                char const *st) {
+  size_t len = strlen(st) + 1;
+  if (backup)
+    assert(PTraceRead(pid, backup, pt_ptr, len) == len);
+  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
+  return len;
+}
+
 #define INTERCEPT_FILE1(pid, arg)                                              \
   char backupstr[1024];                                                        \
   char have_str[1024], chroot[1023];                                           \
-  int64_t backup_len, olen;                                                    \
+  int64_t backup_len;                                                          \
   void *orig_ptr;                                                              \
   orig_ptr = (void *)ABIGetArg(pid, arg);                                      \
   ReadPTraceString(have_str, pid, orig_ptr);                                   \
@@ -251,25 +235,23 @@ void InterceptWrite(pid_t pid, const char *str) {
 #define INTERCEPT_FILE1_ONLY_ABS(pid, arg)                                     \
   char backupstr[1024];                                                        \
   char have_str[1024], chroot[1023];                                           \
-  int64_t backup_len, olen;                                                    \
+  int64_t backup_len;                                                          \
   void *orig_ptr;                                                              \
   orig_ptr = (void *)ABIGetArg(pid, arg);                                      \
   ReadPTraceString(have_str, pid, orig_ptr);                                   \
   if (have_str[0] == '/') {                                                    \
     GetChrootedPath(chroot, pid, have_str);                                    \
     backup_len = WritePTraceString(backupstr, pid, orig_ptr, chroot);          \
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);                                      \
+    ptrace(PT_TO_SCX, pid, (void *)1ul, 0);                                    \
     waitpid(pid, NULL, 0);                                                     \
     PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);                  \
   } else {                                                                     \
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);                                      \
+    ptrace(PT_TO_SCX, pid, (void *)1ul, 0);                                    \
     waitpid(pid, NULL, 0);                                                     \
   }
 
-void InterceptRealPathAt(pid_t pid) {
-  char backupstr[1024];
+static void InterceptRealPathAt(pid_t pid) {
   char have_str[1024], chroot[1023];
-  int64_t backup_len, olen;
   void *orig_ptr, *to_ptr;
   orig_ptr = (void *)ABIGetArg(pid, 1);
   to_ptr = (void *)ABIGetArg(pid, 2);
@@ -282,49 +264,49 @@ void InterceptRealPathAt(pid_t pid) {
   ABISetReturn(pid, 0, 0);
 }
 
-void InterceptAccess(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptAccess(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
-void InterceptOpen(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptOpen(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
-static int64_t IsMagicFile(char *chrooted_name, char *prog_name_to) {
+static bool CheckShebang(char *chrooted_name, char *prog_name_to) {
   if (access(chrooted_name, F_OK))
-    return 0;
-  char buf[1024], *ptr;
-  int64_t l;
-  FILE *f = fopen(chrooted_name, "rb");
-  l = fread(buf, 1, 1023, f);
-  fclose(f);
-  if (l >= 0)
-    buf[l] = 0;
-  if (!strncmp(buf, "#!", 2)) {
-    if (!strchr(buf, '\n'))
-      return 0;
-    *strchr(buf, '\n') = 0;
-    if (prog_name_to)
-      strcpy(prog_name_to, buf + 2);
-    return 1;
+    return false;
+  char buf[0x100], *ptr;
+  int fd = open(chrooted_name, O_RDONLY);
+  ssize_t readb = read(fd, buf, 0xFF);
+  close(fd);
+  if (readb < 2)
+    return false;
+  if (!memcmp(buf, "#!", 2)) {
+    buf[readb] = 0;
+    if (!(ptr = strchr(buf + 2, '\n')))
+      return false;
+    if (prog_name_to) {
+      ptr = mempcpy(prog_name_to, buf + 2, ptr - (buf + 2));
+      *ptr = 0;
+    }
+    return true;
   }
-  return 0;
+  return false;
 }
 
 static char *SkipWhitespace(char *p) {
-  while (*p && isblank(*p))
+  while (*p && isblank((unsigned char)*p))
     p++;
   return p;
 }
-void *PTraceReadPtr(pid_t pid, char *at) {
-  uint64_t ptr = ((uint64_t)ptrace(PT_READ_D, pid, at, 0)) & 0xffFFffFFul;
-  ptr |= (uint64_t)ptrace(PT_READ_D, pid, at + 4, 0) << 32ul;
-  return (void *)ptr;
+
+static void *PTraceReadPtr(pid_t pid, void *at) {
+  void *ret;
+  assert(PTraceRead(pid, &ret, at, 8) == 8);
+  return ret;
 }
 
-void *PTraceWritePtr(pid_t pid, void *at, void *ptr) {
-  ptrace(PT_WRITE_D, pid, at, ((uint64_t)ptr) & 0xffFFffFFul);
-  ptrace(PT_WRITE_D, pid, (char *)at + 4, ((uint64_t)ptr) >> 32ul);
-  return ptr;
+static void PTraceWritePtr(pid_t pid, void *at, void *ptr) {
+  assert(PTraceWrite(pid, at, &ptr, 8) == 8);
 }
 
-void InterceptExecve(pid_t pid) {
+static void InterceptExecve(pid_t pid) {
   char have_str[1024], chroot[1024], backup[1024], poop_ant[1024];
   char *orig_ptr, **argv, **env;
   char *ptr, *ptr2, *command, *argument;
@@ -336,7 +318,7 @@ void InterceptExecve(pid_t pid) {
   ReadPTraceString(have_str, pid, orig_ptr);
   GetChrootedPath(chroot, pid, have_str);
   memset(poop_ant, 0, sizeof(poop_ant));
-  if (!IsMagicFile(chroot, poop_ant)) {
+  if (!CheckShebang(chroot, poop_ant)) {
     // fexeve(open(poopy,O_EXEC),argv,env)
     ABISetSyscall(pid, 5);
     ABISetArg(pid, 1, O_EXEC);
@@ -350,7 +332,7 @@ void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    ptrace(PT_SC_REMOTE, pid, &rmt, sizeof(rmt));
+    ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   } else {
     char *extra_arg_ptrs[256];
     // fexecve(open("interrepret name"),argv,env)
@@ -416,12 +398,12 @@ void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    ptrace(PT_SC_REMOTE, pid, &rmt, sizeof(rmt));
+    ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   }
 }
 
-int64_t UnChrootPath(char *to, char *from) {
-  char buf[1024];
+static int64_t UnChrootPath(char *to, char *from) {
+  char buf[1024], *cur = buf;
   CMountPoint *mp, *best = root_mount;
   int64_t trim, best_len = 0xffff, len;
   for (mp = mount_head.next; mp != &mount_head; mp = mp->next) {
@@ -435,20 +417,20 @@ int64_t UnChrootPath(char *to, char *from) {
   }
 
   trim = strlen(best->dst_path);
-  strcpy(buf, "/");
-  StrMove(&buf[1], &from[trim]);
+  *cur++ = '/';
+  StrMove(cur, from + trim);
   if (to)
     strcpy(to, buf);
   return strlen(buf);
 }
 
-void InterceptReadlink(pid_t pid) {
+static void InterceptReadlink(pid_t pid) {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, buf_len, r, trim;
+  int64_t backup_len, r;
   void *orig_ptr = (void *)ABIGetArg(pid, 0),
        *buf_ptr = (void *)ABIGetArg(pid, 2);
-  buf_len = ABIGetArg(pid, 1);
+  // buf_len = ABIGetArg(pid, 1);
   ReadPTraceString(got_path, pid, orig_ptr);
   GetChrootedPath(new_path, pid, got_path);
   backup_len = WritePTraceString(backup, pid, orig_ptr, new_path);
@@ -468,10 +450,10 @@ void InterceptReadlink(pid_t pid) {
   }
 }
 
-void InterceptReadlinkAt(pid_t pid) {
+static void InterceptReadlinkAt(pid_t pid) {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, buf_len = ABIGetArg(pid, 3), r, trim;
+  int64_t backup_len, /*buf_len = ABIGetArg(pid, 3), */ r;
   void *orig_ptr = (void *)ABIGetArg(pid, 1),
        *buf_ptr = (void *)ABIGetArg(pid, 2);
   ReadPTraceString(got_path, pid, orig_ptr);
@@ -525,16 +507,16 @@ void InterceptReadlinkAt(pid_t pid) {
   PTraceRestoreBytes(pid, orig_ptr1, backup1, backup_len1);                    \
   PTraceRestoreBytes(pid, dumb_ptr, backup2, backup_len2);
 
-void InterceptLink(pid_t pid) { INTERCEPT_FILE2(pid, 0, 1); }
+static void InterceptLink(pid_t pid) { INTERCEPT_FILE2(pid, 0, 1); }
 
-void InterceptUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
-void InterceptShmRename(pid_t pid) { INTERCEPT_FILE2(pid, 0, 1); }
+static void InterceptShmRename(pid_t pid) { INTERCEPT_FILE2(pid, 0, 1); }
 
-void InterceptChdir(pid_t pid) {
+static void InterceptChdir(pid_t pid) {
   char backupstr[1024];
   char have_str[1024], chroot[1023];
-  int64_t backup_len, olen;
+  int64_t backup_len;
   void *orig_ptr;
   orig_ptr = (void *)ABIGetArg(pid, 0);
   ReadPTraceString(have_str, pid, orig_ptr);
@@ -545,7 +527,7 @@ void InterceptChdir(pid_t pid) {
   PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);
 }
 
-void Intercept__Getcwd(pid_t pid) {
+static void Intercept__Getcwd(pid_t pid) {
   int64_t olen, cap;
   void *orig_ptr;
   char cwd[1024];
@@ -558,58 +540,56 @@ void Intercept__Getcwd(pid_t pid) {
   ABISetReturn(pid, 0, 0);
 }
 
-void InterceptMount(pid_t pid) {
+static void InterceptMount(pid_t pid) {
+  (void)pid;
   // TODO
 }
 
-void InterceptUnmount(pid_t pid) {
+static void InterceptUnmount(pid_t pid) {
+  (void)pid;
   // TODO
 }
 
-void InterceptNmount(pid_t pid) {
+static void InterceptNmount(pid_t pid) {
+  (void)pid;
   // TODO
 }
 
-void InterceptAccessShmUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptAccessShmUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
-void InterceptAccessTruncate(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptAccessTruncate(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
-struct stat;
+static void InterceptFstat(pid_t pid) {
+  // makes the file look like it was made by root (TODO enable/disable this from
+  // command line)
+  uint8_t *ptr = (void *)ABIGetArg(pid, 1);
+  ptrace(PT_TO_SCX, pid, (void *)1, 0);
+  waitpid(pid, NULL, 0);
+#define W(p, T, m)                                                                \
+  PTraceWrite(pid, p + offsetof(T, m), &(size_t){0}, sizeof declval(T).m);
+  W(ptr, struct stat, st_uid);
+  W(ptr, struct stat, st_gid);
+}
 
-void InterceptFstat(pid_t pid) {
+static void InterceptFhstat(pid_t pid) {
   // makes the file look like it was made by root (TODO enable/disable this from
   // command line)
   char *ptr = (void *)ABIGetArg(pid, 1);
-  int64_t o1 = offsetof(struct stat, st_uid),
-          o2 = offsetof(struct stat, st_gid);
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
   waitpid(pid, NULL, 0);
-  ptrace(PT_WRITE_D, pid, ptr + o1, 0);
-  ptrace(PT_WRITE_D, pid, ptr + o2, 0);
+  W(ptr, struct stat, st_uid);
+  W(ptr, struct stat, st_gid);
 }
 
-void InterceptFhstat(pid_t pid) {
+static void InterceptFstatat(pid_t pid) {
   // makes the file look like it was made by root (TODO enable/disable this from
   // command line)
-  char *ptr = (void *)ABIGetArg(pid, 1);
-  int64_t o1 = offsetof(struct stat, st_uid),
-          o2 = offsetof(struct stat, st_gid);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ptrace(PT_WRITE_D, pid, ptr + o1, 0);
-  ptrace(PT_WRITE_D, pid, ptr + o2, 0);
-}
-
-void InterceptFstatat(pid_t pid) {
-  // makes the file look like it was made by root (TODO enable/disable this from
-  // command line)
-  char *statp = (void *)ABIGetArg(pid, 2);
-  int64_t o1 = offsetof(struct stat, st_uid),
-          o2 = offsetof(struct stat, st_gid);
+  char *ptr = (void *)ABIGetArg(pid, 2);
   INTERCEPT_FILE1_ONLY_ABS(pid, 1);
-  ptrace(PT_WRITE_D, pid, statp + o1, 0);
-  ptrace(PT_WRITE_D, pid, statp + o2, 0);
+  W(ptr, struct stat, st_uid);
+  W(ptr, struct stat, st_gid);
 }
+#undef W
 
 static void FakeGroup(pid_t pid) {
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
@@ -634,11 +614,11 @@ int main(int argc, const char **argv, const char **env) {
   pid_t pid, pid2;
   int64_t idx;
   char chroot_bin[1024];
-  CProcInfo *pnext, *plast;
+  // CProcInfo *pnext, *plast;
   if (argc < 3) {
     fprintf(stderr, "Usage %s [chroot] [shell] ...",
             argc > 0 ? argv[0] : "slim_jail");
-    exit(1);
+    return 1;
   }
   proc_head.last = &proc_head;
   proc_head.next = &proc_head;
@@ -649,13 +629,13 @@ int main(int argc, const char **argv, const char **env) {
   root_mount = AddMountPoint(argv[1], "/");
   AddMountPoint("/dev", "/dev");
 
-  if (pid = fork()) {
+  if ((pid = fork())) {
     int cond;
-    while (pid2 = waitpid(-1, &cond, WUNTRACED)) {
+    while ((pid2 = waitpid(-1, &cond, WUNTRACED))) {
       if (WIFEXITED(cond) && pid2 == pid)
         exit(0);
       struct ptrace_lwpinfo inf;
-      ptrace(PT_LWPINFO, pid2, &inf, sizeof(inf));
+      ptrace(PT_LWPINFO, pid2, (caddr_t)&inf, sizeof inf);
       if (WIFEXITED(cond)) {
         continue;
       } else if (WIFSIGNALED(cond)) {
@@ -680,14 +660,14 @@ int main(int argc, const char **argv, const char **env) {
         rmt.pscr_args = args;
         rmt.pscr_nargs = 1;
         rmt.pscr_syscall = 183; // seteuid
-        ptrace(PT_SC_REMOTE, pid2, &rmt, sizeof(rmt));
+        ptrace(PT_SC_REMOTE, pid2, (caddr_t)&rmt, sizeof(rmt));
         ptrace(PT_TO_SCX, pid2, (void *)1, 0);
         waitpid(pid2, NULL, 0);
         args[0] = 0; // wheel
         rmt.pscr_args = args;
         rmt.pscr_nargs = 1;
         rmt.pscr_syscall = 182; // setegid
-        ptrace(PT_SC_REMOTE, pid2, &rmt, sizeof(rmt));
+        ptrace(PT_SC_REMOTE, pid2, (caddr_t)&rmt, sizeof(rmt));
         ptrace(PT_TO_SCX, pid2, (void *)1, 0);
         waitpid(pid2, NULL, 0);
       }
@@ -755,13 +735,12 @@ int main(int argc, const char **argv, const char **env) {
         } break;
         case 49: { // getlogin
           // TODO check for root spoofing
-          char *who = "root";
-          int64_t len = ABIGetArg(pid2, 1);
+          char const *who = "root";
+          // int64_t len = ABIGetArg(pid2, 1);
           char *to = (char *)ABIGetArg(pid2, 0);
           ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-          if (to) {
+          if (to)
             WritePTraceString(NULL, pid2, to, who);
-          }
         } break;
         case 54: // ioctl
           break;
@@ -839,6 +818,8 @@ int main(int argc, const char **argv, const char **env) {
         case 191: { // pathconf
           INTERCEPT_FILE1(pid2, 0);
         } break;
+        /*case 202: { // TODO sysctl
+        } break;*/
         case 204: { // undelete
           INTERCEPT_FILE1(pid2, 0);
         } break;
@@ -1054,45 +1035,48 @@ int main(int argc, const char **argv, const char **env) {
     }
   } else {
     const char *dummy_argv[argc - 3 + 1 + 1];
-    char buf[1024];
-    FILE *f, *f2;
     int64_t r, has_ld_preload;
     dummy_argv[0] = argv[2];
-    for (idx = 0; idx != argc - 3; idx++) {
+    for (idx = 0; idx != argc - 3; idx++)
       dummy_argv[idx + 1] = argv[idx + 3];
-    }
     dummy_argv[argc - 3 + 1] = NULL;
     ptrace(PT_TRACE_ME, pid, NULL, 0);
     GetChrootedPath(chroot_bin, pid, argv[2]);
+    int f, f2;
     // Add libpl_hack.so to the chroot to patch elf_aux_info
-    if (access("libpl_hack.so", F_OK)) {
+    if (-1 == (f = open("libpl_hack.so", O_RDONLY))) {
       fprintf(stderr,
               "I need the libpl_hack.so file to patch elf_aux_info please.\n");
-      exit(1);
+      return 1;
     }
-    f = fopen("libpl_hack.so", "rb");
+    struct stat fst;
+    fstat(f, &fst);
     chdir(argv[1]);
-    f2 = fopen("libpl_hack.so", "wb");
-    while ((r = fread(buf, 1, 1024, f)) > 0)
-      fwrite(buf, r, 1, f2);
-    fclose(f);
-    fclose(f2);
-    chmod("libpl_hack.so",
-          S_IXGRP | S_IXUSR | S_IXOTH | S_IRGRP | S_IRUSR | S_IROTH | S_IWUSR);
-    char nenv_d[1024][256];
+    f2 = open("libpl_hack.so", O_WRONLY);
+    ssize_t wrb;
+    for (off_t o = 0; o < fst.st_size; o += wrb) {
+      wrb = copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
+      if (wrb == -1) {
+        fprintf(stderr, "Failed copying library: %s\n", strerror(errno));
+	return 1;
+      }
+    }
+    close(f), close(f2);
+    chmod("libpl_hack.so", 0755);
+    char nenv_d[256][1024];
     char *nenv[256];
     has_ld_preload = 0;
     for (r = 0; env[r]; r++) {
       if (!strncmp("LD_PRELOAD=", env[r], strlen("LD_PRELOAD="))) {
         has_ld_preload = 1;
-        sprintf(&nenv_d[r], "%s %s", env[r], "/libpl_hack.so");
+        sprintf(nenv_d[r], "%s %s", env[r], "/libpl_hack.so");
       } else
-        strcpy(&nenv_d[r], env[r]);
-      nenv[r] = &nenv_d[r];
+        strcpy(nenv_d[r], env[r]);
+      nenv[r] = nenv_d[r];
     }
     if (!has_ld_preload) {
-      strcpy(&nenv_d[r], "LD_PRELOAD=/libpl_hack.so");
-      nenv[r] = &nenv_d[r];
+      strcpy(nenv_d[r], "LD_PRELOAD=/libpl_hack.so");
+      nenv[r] = nenv_d[r];
       r++;
     }
     nenv[r] = NULL;

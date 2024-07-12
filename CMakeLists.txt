@@ -3,15 +3,16 @@ project(mrchroot
   LANGUAGES C)
 add_executable(${PROJECT_NAME}
   main.c
-  abi.c)
-set_target_properties(${PROJECT_NAME}
+  ptrace.c ptrace.h
+  abi.c abi.h)
+add_library(pl_hack SHARED
+  preload_hack.c)
+set_target_properties(${PROJECT_NAME} pl_hack
   PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES
     C_EXTENSIONS YES
     C_VISIBILITY_PRESET hidden)
-add_library(pl_hack SHARED
-  preload_hack.c)
 
 target_link_libraries(pl_hack PRIVATE dl)
 target_link_libraries(mrchroot PRIVATE procstat)
