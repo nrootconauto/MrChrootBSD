@@ -427,10 +427,9 @@ static int64_t UnChrootPath(char *to, char *from) {
 static void InterceptReadlink(pid_t pid) {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, r;
+  int64_t backup_len, r,r2,buf_len=ABIGetArg(pid, 2);
   void *orig_ptr = (void *)ABIGetArg(pid, 0),
-       *buf_ptr = (void *)ABIGetArg(pid, 2);
-  // buf_len = ABIGetArg(pid, 1);
+       *buf_ptr = (void *)ABIGetArg(pid, 1);
   ReadPTraceString(got_path, pid, orig_ptr);
   GetChrootedPath(new_path, pid, got_path);
   backup_len = WritePTraceString(backup, pid, orig_ptr, new_path);
@@ -440,12 +439,15 @@ static void InterceptReadlink(pid_t pid) {
 
   r = readlink(new_path, rlbuf, 1024);
   UnChrootPath(rlbuf, new_path);
-  PTraceWriteBytes(pid, buf_ptr, rlbuf, strlen(rlbuf) + 1);
-  ReadPTraceString(got_path, pid, buf_ptr);
   if (r < 0) {
     ABISetReturn(pid, r, 1);
   } else {
     r = strlen(rlbuf);
+    if(r>buf_len)
+      r2=buf_len;
+    else
+      r2=r+1;
+    PTraceWriteBytes(pid, buf_ptr, rlbuf, r2);
     ABISetReturn(pid, r, 0);
   }
 }
@@ -453,7 +455,7 @@ static void InterceptReadlink(pid_t pid) {
 static void InterceptReadlinkAt(pid_t pid) {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, /*buf_len = ABIGetArg(pid, 3), */ r;
+  int64_t backup_len, buf_len = ABIGetArg(pid, 3), r;
   void *orig_ptr = (void *)ABIGetArg(pid, 1),
        *buf_ptr = (void *)ABIGetArg(pid, 2);
   ReadPTraceString(got_path, pid, orig_ptr);
