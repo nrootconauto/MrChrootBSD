@@ -3,9 +3,9 @@
 #include "mrchroot.h"
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
-#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +39,7 @@ class (CProcInfo) {
 
 /* clang-format on */
 #define declval(T) (*(T *)0ul)
+#define Startswith(s, what) (!memcmp((s), (what), strlen(what)))
 
 // TODO account for pid(chroot/jail etc)
 static int64_t UnChrootPath(char *to, char *from);
@@ -47,7 +48,9 @@ static int64_t GetProcCwd(char *to, pid_t pid) {
   unsigned cnt = 0;
   int64_t res_cnt = 0;
   char buf[1024];
-  struct procstat *ps = procstat_open_sysctl();
+  static struct procstat *ps;
+  if (!ps)
+    ps = procstat_open_sysctl();
   struct filestat_list *head;
   // See /usr/src/use.bin/procstat in FreeBSD
   struct filestat *fs;
@@ -127,7 +130,7 @@ static int64_t NormailizePath(char *to, const char *path) {
 
 static int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
   int64_t idx;
-  size_t max_match = 0;
+  size_t max_match = 0, len;
   char result[1024];
   char s[1024], *cur = s;
   // CProcInfo *pi = GetProcInfByPid(pid);
@@ -145,16 +148,14 @@ static int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
   for (mp = mount_head.next; mp != &mount_head; mp = mp->next) {
     // FORCE it to be normal(failsafe)
     NormailizePath(mp->src_path, mp->src_path);
-    if (max_match < strlen(mp->src_path))
-      if (!strncmp(mp->src_path, result, strlen(mp->src_path))) {
-        max_match = strlen(mp->src_path);
+    if (max_match < (len = strlen(mp->src_path)))
+      if (Startswith(result, mp->src_path)) {
+        max_match = len;
         choose = mp;
       }
   }
   if (!choose) {
-    fprintf(stderr,
-            "Fucking ass poodles;unable to find mount point for \"%s\".\n",
-            result);
+    fprintf(stderr, "Unable to find mount point for \"%s\"\n", result);
     exit(1);
   }
   mp = choose;
@@ -270,10 +271,10 @@ static void InterceptAccess(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 static void InterceptOpen(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
 static bool CheckShebang(char *chrooted_name, char *prog_name_to) {
-  if (access(chrooted_name, F_OK))
+  int fd = open(chrooted_name, O_RDONLY);
+  if (-1 == fd)
     return false;
   char buf[0x100], *ptr;
-  int fd = open(chrooted_name, O_RDONLY);
   ssize_t readb = read(fd, buf, 0xFF);
   close(fd);
   if (readb < 2)
@@ -368,7 +369,7 @@ static void InterceptExecve(pid_t pid) {
     while (*ptr2) {
       ptr2 = SkipWhitespace(ptr2);
       argument = ptr2;
-      while (*ptr2 && !isblank(*ptr2))
+      while (*ptr2 && !isblank((unsigned char)*ptr2))
         ptr2++;
       *ptr2++ = 0;
       extra_arg_ptrs[extra_args++] = ptr;
@@ -436,7 +437,7 @@ static int64_t UnChrootPath(char *to, char *from) {
 static void InterceptReadlink(pid_t pid) {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, r,r2,buf_len=ABIGetArg(pid, 2);
+  int64_t backup_len, r, buf_len = ABIGetArg(pid, 2);
   void *orig_ptr = (void *)ABIGetArg(pid, 0),
        *buf_ptr = (void *)ABIGetArg(pid, 1);
   ReadPTraceString(got_path, pid, orig_ptr);
@@ -452,11 +453,7 @@ static void InterceptReadlink(pid_t pid) {
     ABISetReturn(pid, r, 1);
   } else {
     r = strlen(rlbuf);
-    if(r>buf_len)
-      r2=buf_len;
-    else
-      r2=r+1;
-    PTraceWriteBytes(pid, buf_ptr, rlbuf, r2);
+    PTraceWriteBytes(pid, buf_ptr, rlbuf, r > buf_len ? buf_len : r + 1);
     ABISetReturn(pid, r, 0);
   }
 }
@@ -485,7 +482,7 @@ static void InterceptReadlinkAt(pid_t pid) {
   else {
     UnChrootPath(rlbuf, new_path);
     r = strlen(rlbuf);
-    PTraceWriteBytes(pid, buf_ptr, rlbuf, r);
+    PTraceWriteBytes(pid, buf_ptr, rlbuf, r > buf_len ? buf_len : r + 1);
     ABISetReturn(pid, r, 0);
   }
 }
@@ -576,8 +573,8 @@ static void InterceptFstat(pid_t pid) {
   uint8_t *ptr = (void *)ABIGetArg(pid, 1);
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
   waitpid(pid, NULL, 0);
-#define W(p, T, m)                                                                \
-  PTraceWrite(pid, p + offsetof(T, m), &(size_t){0}, sizeof declval(T).m);
+#define W(p, T, m)                                                             \
+  PTraceWrite(pid, p + offsetof(T, m), &(size_t){0}, sizeof declval(T).m)
   W(ptr, struct stat, st_uid);
   W(ptr, struct stat, st_gid);
 }
@@ -1075,39 +1072,45 @@ int main(int argc, const char **argv, const char **env) {
     GetChrootedPath(chroot_bin, pid, argv[2]);
     int f, f2;
     // Add libpl_hack.so to the chroot to patch elf_aux_info
-    if (-1 == (f = open("libpl_hack.so", O_RDONLY))) {
+#define DLLNAME "libpl_hack.so"
+    if (-1 == (f = open(DLLNAME, O_RDONLY))) {
       fprintf(stderr,
-              "I need the libpl_hack.so file to patch elf_aux_info please.\n");
+              "I need the " DLLNAME " file to patch elf_aux_info please.\n");
       return 1;
     }
     struct stat fst;
     fstat(f, &fst);
     char *chroot_root=realpath(argv[1],NULL);
     chdir(argv[1]);
-    f2 = open("libpl_hack.so", O_WRONLY);
-    ssize_t wrb;
-    for (off_t o = 0; o < fst.st_size; o += wrb) {
-      wrb = copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
-      if (wrb == -1) {
-        fprintf(stderr, "Failed copying library: %s\n", strerror(errno));
-	return 1;
+    if (access(DLLNAME, F_OK)) {
+      struct stat fst;
+      fstat(f, &fst);
+      f2 = open(DLLNAME, O_WRONLY | O_CREAT, 0755);
+      ssize_t wrb;
+      for (off_t o = 0; o < fst.st_size; o += wrb) {
+        wrb = copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
+        if (-1 == wrb) {
+          fprintf(stderr, "Failed copying library: %s\n", strerror(errno));
+          return 1;
+        }
       }
-    }
-    close(f), close(f2);
-    chmod("libpl_hack.so", 0755);
+      close(f2);
+    } else
+      chmod(DLLNAME, 0755);
+    close(f);
     char nenv_d[256][1024];
     char *nenv[256];
     has_ld_preload = 0;
     for (r = 0; env[r]; r++) {
-      if (!strncmp("LD_PRELOAD=", env[r], strlen("LD_PRELOAD="))) {
+      if (Startswith(env[r], "LD_PRELOAD=")) {
         has_ld_preload = 1;
-        sprintf(nenv_d[r], "%s %s", env[r], "/libpl_hack.so");
+        snprintf(nenv_d[r], sizeof *nenv_d, "%s %s", env[r], "/" DLLNAME);
       } else
         strcpy(nenv_d[r], env[r]);
       nenv[r] = nenv_d[r];
     }
     if (!has_ld_preload) {
-      strcpy(nenv_d[r], "LD_PRELOAD=/libpl_hack.so");
+      strcpy(nenv_d[r], "LD_PRELOAD=/" DLLNAME);
       nenv[r] = nenv_d[r];
       r++;
     }
