@@ -1,6 +1,6 @@
 #include "abi.h"
 #include "ptrace.h"
-
+#include "mrchroot.h"
 #include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -21,7 +21,6 @@
 #include <sys/sysctl.h>
 #include <sys/user.h>
 #include <libprocstat.h>
-
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
@@ -34,6 +33,8 @@ class (CMountPoint) {
 class (CProcInfo) {
   CProcInfo *last, *next;
   pid_t pid;
+  CMrChrootHackPtrs *hacks_array_ptr;
+  int64_t flags;
 } proc_head;
 
 /* clang-format on */
@@ -305,13 +306,17 @@ static void *PTraceReadPtr(pid_t pid, void *at) {
 static void PTraceWritePtr(pid_t pid, void *at, void *ptr) {
   assert(PTraceWrite(pid, at, &ptr, 8) == 8);
 }
-
+static void *GetHackDataAreaForPid(pid_t pid) {
+	CProcInfo *pinf=GetProcInfByPid(pid);
+	return PTraceReadPtr(pid,&pinf->hacks_array_ptr->data_zone);
+}
 static void InterceptExecve(pid_t pid) {
   char have_str[1024], chroot[1024], backup[1024], poop_ant[1024];
-  char *orig_ptr, **argv, **env;
+  char *orig_ptr, **argv, **env,**argv2,**argv3;
   char *ptr, *ptr2, *command, *argument;
   int64_t fd, args[3], bulen, extra_args = 0;
   struct ptrace_sc_remote rmt;
+  CProcInfo *pinf=GetProcInfByPid(pid);
   orig_ptr = (void *)ABIGetArg(pid, 0);
   argv = (void *)ABIGetArg(pid, 1);
   env = (void *)ABIGetArg(pid, 2);
@@ -319,9 +324,12 @@ static void InterceptExecve(pid_t pid) {
   GetChrootedPath(chroot, pid, have_str);
   memset(poop_ant, 0, sizeof(poop_ant));
   if (!CheckShebang(chroot, poop_ant)) {
-    // fexeve(open(poopy,O_EXEC),argv,env)
-    ABISetSyscall(pid, 5);
+	  char *tmp1,*tmp2;
+    // exeve(open(chrooted),argv,env)
+    ABISetSyscall(pid, 5); //iopen
     ABISetArg(pid, 1, O_EXEC);
+    ReadPTraceString(poop_ant,pid,orig_ptr);
+    GetChrootedPath(chroot, pid, poop_ant);
     bulen = WritePTraceString(backup, pid, orig_ptr, chroot);
     ptrace(PT_TO_SCX, pid, (void *)1, 0);
     waitpid(pid, NULL, 0);
@@ -332,6 +340,7 @@ static void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
+    
     ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   } else {
     char *extra_arg_ptrs[256];
@@ -351,7 +360,7 @@ static void InterceptExecve(pid_t pid) {
     PTraceRestoreBytes(pid, orig_ptr, backup, bulen);
     // Insert the pointer to the command name before argv(I will dump the name
     // to NULL,it doesnt matter as we will change the program image at fexecve)
-    ptr = orig_ptr - 0x10000;
+    ptr=GetHackDataAreaForPid(pid);
     extra_args = 0;
     WritePTraceString(NULL, pid, ptr, command);
     extra_arg_ptrs[extra_args++] = ptr;
@@ -655,6 +664,10 @@ int main(int argc, const char **argv, const char **env) {
       }
     normal:
       ptrace(PT_FOLLOW_FORK, pid2, NULL, 1);
+      if (inf.pl_flags & PL_FLAG_FORKED) {
+		  //Inheret our hacks from LD_PRELOAD hack
+        GetProcInfByPid(inf.pl_child_pid)->hacks_array_ptr=GetProcInfByPid(pid2)->hacks_array_ptr;
+	  }
       if (inf.pl_flags & PL_FLAG_CHILD) {
         struct ptrace_sc_remote rmt;
         int64_t args[1];
@@ -675,10 +688,26 @@ int main(int argc, const char **argv, const char **env) {
       }
       if (inf.pl_flags & PL_FLAG_SCE) {
         switch (inf.pl_syscall_code) {
+		case MR_CHROOT_NOSYS: {
+			char chrooted[1024];
+			//In preload_hack.c,I use an indrtiect syscall,so use argument 1 instead of 0
+			CProcInfo *pinf=GetProcInfByPid(pid2);
+			pinf->hacks_array_ptr=(CMrChrootHackPtrs*)ABIGetArg(pid2,1);
+			
+		    char *write_chroot_to=(char*)ABIGetArg(pid2,2);
+		    ReadPTraceString(chrooted,pid2,write_chroot_to);
+		    GetChrootedPath(chrooted,pid2,"/");		    
+		    PTraceWriteBytes(pid2, write_chroot_to, chrooted, strlen(chrooted) + 1);
+		    ABISetSyscall(pid2,36); //Sync Takes no arguments,repalce with valid syscall(to avoid a signal for invalid syscall)
+		    ptrace(PT_TO_SCX, pid2, (void *)1, 0);
+			waitpid(pid2, NULL, 0);
+		  }
+		  break;
         case 1: // exit
           ptrace(PT_DETACH, pid2, NULL, 0);
           break;
         case 2: // fork
+        
           break;
         case 3: // read
           break;
@@ -1053,6 +1082,7 @@ int main(int argc, const char **argv, const char **env) {
     }
     struct stat fst;
     fstat(f, &fst);
+    char *chroot_root=realpath(argv[1],NULL);
     chdir(argv[1]);
     f2 = open("libpl_hack.so", O_WRONLY);
     ssize_t wrb;
@@ -1081,6 +1111,12 @@ int main(int argc, const char **argv, const char **env) {
       nenv[r] = nenv_d[r];
       r++;
     }
+    //Realy dumb part that wil be fixed/improved in the future
+    int64_t dumb_len=snprintf(NULL,0,"LD_LIBRARY_PATH=%s/lib:%s/usr/lib:%s/usr/local/lib",chroot_root,chroot_root,chroot_root);    
+    char dumb_fix[dumb_len+1];
+    sprintf(dumb_fix,"LD_LIBRARY_PATH=%s/lib:%s/usr/lib:%s/usr/local/lib",chroot_root,chroot_root,chroot_root);
+    nenv[r]=dumb_fix;
+    r++;
     nenv[r] = NULL;
     execve(chroot_bin, dummy_argv, nenv);
   }
