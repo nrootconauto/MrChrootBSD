@@ -311,9 +311,51 @@ static void *GetHackDataAreaForPid(pid_t pid) {
 	CProcInfo *pinf=GetProcInfByPid(pid);
 	return PTraceReadPtr(pid,&pinf->hacks_array_ptr->data_zone);
 }
+//Returns end of written data
+static char *RewriteEnv(pid_t pid,char **prog_env,char *data_ptr) {
+	int64_t idx,idx2,argc=0;
+	char *arg;
+	char val[4048];
+	char chrooted[4048],orig[4048],final[4048];
+	for(idx=0;arg=PTraceReadPtr(pid,prog_env+idx);idx++)
+	  argc++;
+	char *new_env_ptrs[argc];
+	for(idx=0;arg=PTraceReadPtr(pid,prog_env+idx);idx++) {
+		#define LD_LIBRARY_PATH_EQ "LD_LIBRARY_PATH="
+		ReadPTraceString(val,pid,arg);
+		if(!strncmp(LD_LIBRARY_PATH_EQ,val,strlen(LD_LIBRARY_PATH_EQ))) {
+			strcpy(final,LD_LIBRARY_PATH_EQ);
+			char *start=val+strlen(LD_LIBRARY_PATH_EQ),*end;
+again:
+			end=start;
+			while(*end&&*end!=':')
+			   end++;
+			orig[0]=0;
+			idx2=0;
+			while(start!=end) {
+				orig[idx2++]=*start++;
+			}
+			orig[idx2]=0;
+			GetChrootedPath(chrooted,pid,orig);
+			strcpy(final+strlen(final),chrooted);
+			if(*end==':') {
+				strcpy(final+strlen(final),":");
+				start=end+1;
+				goto again;
+			}
+			WritePTraceString(NULL,pid,data_ptr,final);
+			new_env_ptrs[idx]=data_ptr;
+			PTraceWritePtr(pid,new_env_ptrs[idx],prog_env+idx);
+			data_ptr+=strlen(final)+1;
+		} else {
+			new_env_ptrs[idx]=arg;
+		}
+	}
+	return data_ptr;
+}
 static void InterceptExecve(pid_t pid) {
   char have_str[1024], chroot[1024], backup[1024], poop_ant[1024];
-  char *orig_ptr, **argv, **env,**argv2,**argv3;
+  char *orig_ptr, **argv, **env;
   char *ptr, *ptr2, *command, *argument;
   int64_t fd, args[3], bulen, extra_args = 0;
   struct ptrace_sc_remote rmt;
@@ -341,7 +383,7 @@ static void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    
+    RewriteEnv(pid,env,GetHackDataAreaForPid(pid));
     ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   } else {
     char *extra_arg_ptrs[256];
@@ -408,6 +450,7 @@ static void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
+    RewriteEnv(pid,env,ptr);
     ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   }
 }
@@ -1114,11 +1157,7 @@ int main(int argc, const char **argv, const char **env) {
       nenv[r] = nenv_d[r];
       r++;
     }
-    //Realy dumb part that wil be fixed/improved in the future
-    int64_t dumb_len=snprintf(NULL,0,"LD_LIBRARY_PATH=%s/lib:%s/usr/lib:%s/usr/local/lib",chroot_root,chroot_root,chroot_root);    
-    char dumb_fix[dumb_len+1];
-    sprintf(dumb_fix,"LD_LIBRARY_PATH=%s/lib:%s/usr/lib:%s/usr/local/lib",chroot_root,chroot_root,chroot_root);
-    nenv[r]=dumb_fix;
+    nenv[r]="LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
     r++;
     nenv[r] = NULL;
     execve(chroot_bin, dummy_argv, nenv);
