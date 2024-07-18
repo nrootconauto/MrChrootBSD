@@ -1,14 +1,28 @@
 # MrChrootBSD
   This program is a chroot like utility for FreeBSD,which is by far the most sexy BSD available. I like [PRoot](https://proot-me.github.io/) for testing software(on linux) but I am anaware of such a tool for FreeBSD,so I was left in the dust. Meet `MrChrootBSD`,a **non-root version of chroot** sort of.
 
+## Features
+  Here is a list
+- Do chroot in userspace
+- Partial `ptrace` emulation(limited,you can run `gdb` in your MrChroot's sort of and it will make you happy maybe)
+
+## Non-Features
+  Some of these will be removed(added to features) in the future
+- Full `ptrace` emulation(Dont rely on `PT_TO_SCE`/`PT_TO_SCX` to work).
+- jails
+- daemons
+- sysctl
+
 ## Usage
-This is early in development so stay tuned.
+This is early in development so stay tuned,use it like a normal chroot. Feel free to probe around the source code and send patches to my github.
 
 ```sh
 wget https://download.freebsd.org/releases/amd64/14.0-RELEASE/base.txz
+wget https://download.freebsd.org/releases/amd64/14.0-RELEASE/lib32.txz #Needed for gdb for some reason
 mkdir chroot
 cd chroot 
 tar xvf ../base.txz
+tar xvf ../lib32.txz
 cd ..
 cmake .
 make

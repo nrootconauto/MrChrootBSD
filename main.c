@@ -1,6 +1,6 @@
 #include "abi.h"
-#include "ptrace.h"
 #include "mrchroot.h"
+#include "ptrace.h"
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -24,26 +24,85 @@
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
-
+static int ptrace2(int a,pid_t p,void *add ,int d) {
+	int r=ptrace(a,p,add,d);
+	return r;
+}
+#define ptrace ptrace2
 class (CMountPoint) {
   CMountPoint *last, *next;
   char src_path[1024], dst_path[1024];
 } mount_head, *root_mount;
 
+class (CWaitEvent) {
+	CWaitEvent *last,*next;
+	int code;
+	pid_t to,from;
+	siginfo_t siginf;
+} wait_events;
+#define PIF_WAITING 1
+#define PIF_PTRACE_FOLLOW_FORK 2
+#define PIF_PTRACE_LWP_EVENTS 4
+#define PIF_TRACE_ME 8 //"chrooted" Debugger wants first dibs on the first SIGTRAP
+#define PIF_TRACE_ME2 16
+#define PIF_EXITED 32 
+#define PIF_TO_SCX_ONLY 64 
 class (CProcInfo) {
   CProcInfo *last, *next;
-  pid_t pid;
+  pid_t pid,parent,debugged_by;
+  int wait_for_type,wait_for_id,wait_options;
   CMrChrootHackPtrs *hacks_array_ptr;
   int64_t flags;
+  int ptrace_event_mask;
+  struct ptrace_lwpinfo lwpinfo;
 } proc_head;
-
 /* clang-format on */
-#define declval(T) (*(T *)0ul)
-#define Startswith(s, what) (!memcmp((s), (what), strlen(what)))
+static void RemoveWaitEvent(CWaitEvent *);
+static void RemoveProc(pid_t pid) {
+  CProcInfo *cur, *next, *last;
+  CWaitEvent *wev, *ev_next;
+  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
+    if (pid == cur->pid) {
+      last = cur->last;
+      next = cur->next;
+      next->last = last;
+      last->next = next;
+      free(cur);
+      for (wev = wait_events.next; wev != &wait_events; wev = ev_next) {
+        ev_next = wev->next;
+        if (wev->to == pid)
+          RemoveWaitEvent(wev);
+      }
+      return;
+    }
+  }
+}
+static char *StrMove(char *to, char *from) {
+  int64_t len = strlen(from) + 1;
+  return memmove(to, from, len);
+}
 
-// TODO account for pid(chroot/jail etc)
-static int64_t UnChrootPath(char *to, char *from);
+static int64_t UnChrootPath(char *to, char *from) {
+  char buf[1024], *cur = buf;
+  CMountPoint *mp, *best = root_mount;
+  int64_t trim, best_len = 0xffff, len;
+  for (mp = mount_head.next; mp != &mount_head; mp = mp->next) {
+    len = strlen(mp->dst_path);
+    if (!strncmp(from, mp->dst_path, len)) {
+      if (best_len < len) {
+        best_len = len;
+        best = mp;
+      }
+    }
+  }
 
+  trim = strlen(best->dst_path);
+  *cur++ = '/';
+  StrMove(cur, from + trim);
+  if (to)
+    strcpy(to, buf);
+  return strlen(buf);
+}
 static int64_t GetProcCwd(char *to, pid_t pid) {
   unsigned cnt = 0;
   int64_t res_cnt = 0;
@@ -70,37 +129,431 @@ static int64_t GetProcCwd(char *to, pid_t pid) {
   procstat_freeprocs(ps, kprocs);
   return res_cnt;
 }
-
-static CMountPoint *AddMountPoint(const char *dst, const char *src) {
-  CMountPoint *mp = malloc(sizeof *mp);
-  strcpy(mp->src_path, src);
-  realpath(dst, mp->dst_path);
-  mp->next = mount_head.next;
-  mp->last = &mount_head;
-  mp->next->last = mp;
-  mp->last->next = mp;
-  return mp;
+static void PTraceRestoreBytes(pid_t pid, void *pt_ptr, void *backup,
+                               size_t len) {
+  assert(PTraceWrite(pid, pt_ptr, backup, len) == len);
 }
 
+static void PTraceWriteBytes(pid_t pid, void *pt_ptr, const void *st,
+                             size_t len) {
+  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
+}
+
+#define declval(T) (*(T *)0ul)
+#define Startswith(s, what) (!memcmp((s), (what), strlen(what)))
 static CProcInfo *GetProcInfByPid(pid_t pid) {
   CProcInfo *cur;
   for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
     if (pid == cur->pid)
       return cur;
   }
-  *(cur = malloc(sizeof *cur)) = (CProcInfo){
-      .next = proc_head.next,
-      .last = &proc_head,
-      .pid = pid,
-  };
+  *(cur = malloc(sizeof *cur)) = (CProcInfo){.next = &proc_head,
+                                             .last = proc_head.last,
+                                             .pid = pid,
+                                             .ptrace_event_mask = -1};
   return cur->last->next   //
          = cur->next->last //
          = cur;
 }
 
-static char *StrMove(char *to, char *from) {
-  int64_t len = strlen(from) + 1;
-  return memmove(to, from, len);
+static int64_t PidIsValid(pid_t pid) {
+  CProcInfo *cur;
+  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
+    if (pid == cur->pid)
+      return 1;
+  }
+  return 0;
+}
+
+static void RemoveWaitEvent(CWaitEvent *ev) {
+  CWaitEvent *last = ev->last;
+  CWaitEvent *next = ev->next;
+  if (last)
+    last->next = next;
+  if (next)
+    next->last = last;
+  free(ev);
+}
+static int64_t WaitEventPassesOptions(int what, int options) {
+  if (options & WCONTINUED)
+    if (WIFCONTINUED(what))
+      return 1;
+  if (options & WSTOPPED)
+    if (WIFSTOPPED(what))
+      return 1;
+  if (options & WEXITED)
+    if (WIFEXITED(what))
+      return 1;
+  if (options & WUNTRACED)
+    if (WIFSTOPPED(what)) {
+      return 1;
+    }
+  if (WIFSIGNALED(what))
+    return 1;
+  return 0;
+}
+static int64_t IsChildProc(pid_t child, pid_t parent) {
+  if (!child || !parent)
+    return 0;
+  CProcInfo *pinf = GetProcInfByPid(parent);
+  CProcInfo *cinf = GetProcInfByPid(child);
+  if (!cinf || !pinf)
+    return 0;
+  if (cinf->parent == parent)
+    return 1;
+  return IsChildProc(cinf->parent, parent);
+}
+static void InterceptPtrace(pid_t pid) {
+  int req = ABIGetArg(pid, 0);
+  pid_t who = ABIGetArg(pid, 1);
+  void *addr = (void *)ABIGetArg(pid, 2);
+  int64_t data = ABIGetArg(pid, 3), ret = 0;
+  CProcInfo *pinf;
+  int failed = 0;
+  GetProcInfByPid(who)->debugged_by = pid;
+  switch (req) {
+  case PT_TRACE_ME:
+    pinf = GetProcInfByPid(pid);
+    ABISetSyscall(
+        pid, 20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+    ptrace(PT_TO_SCX, pid, (caddr_t)1, 0);
+    waitpid(pid, NULL, 0);
+    ABISetReturn(pid, 0, NULL);
+    pinf->flags |= PIF_TRACE_ME;
+    pinf->ptrace_event_mask = PL_FLAG_EXEC;
+    break;
+  case PT_CONTINUE:
+  // cool beans
+  // Dont allow child process to use its ptrace,use MrChrootBSD's ptrace
+  case PT_READ_I:
+  case PT_READ_D:
+  case PT_WRITE_I:
+  case PT_WRITE_D:
+    goto use_host_ptrace;
+  case PT_IO: {
+    struct ptrace_io_desc iod, iod2;
+    data = sizeof(iod);
+    PTraceRead(pid, &iod, addr, data);
+    iod2 = iod;
+    size_t len;
+    char *buffer = calloc(1, iod2.piod_len);
+    iod2.piod_addr = buffer;
+    switch (iod.piod_op) {
+    case PIOD_WRITE_I:
+    case PIOD_WRITE_D:
+      PTraceRead(pid, buffer, iod.piod_addr, iod.piod_len);
+      ptrace(PT_IO, who, &iod2, sizeof(iod2));
+      break;
+    case PIOD_READ_I:
+    case PIOD_READ_D:
+      ptrace(PT_IO, who, &iod2, sizeof(iod2));
+      PTraceWrite(pid, iod.piod_addr, buffer, iod.piod_len);
+      break;
+    }
+    // Restore original
+    iod2.piod_addr = iod.piod_addr;
+    PTraceWrite(pid, addr, &iod2, sizeof(iod));
+    free(buffer);
+    goto intercept;
+  }
+  case PT_STEP:
+  case PT_KILL:
+  case PT_ATTACH:
+  case PT_DETACH:
+    goto use_host_ptrace;
+  case PT_GETREGSET:
+  case PT_SETREGSET:
+    printf("imp layer\n");
+    ret = -1;
+    failed = 1;
+    break;
+  case PT_GETFSBASE:
+  case PT_GETGSBASE:
+  case PT_GETREGS:
+  case PT_GETFPREGS:
+  case PT_GETDBREGS:
+  case PT_GETXSTATE_INFO:
+  case PT_GETXSTATE:
+  case PT_LWPINFO: {
+  read_style:;
+    if (req == PT_GETREGS)
+      data = sizeof(struct reg);
+    else if (req == PT_GETFPREGS)
+      data = sizeof(struct fpreg);
+    else if (req == PT_GETDBREGS)
+      data = sizeof(struct dbreg);
+    else if (req == PT_GETXSTATE_INFO)
+      data = sizeof(struct ptrace_xstate_info);
+    else if (req == PT_GETFSBASE)
+      data = sizeof(unsigned long);
+    else if (req == PT_GETGSBASE)
+      data = sizeof(unsigned long);
+    // Write nto poo poo tasks addres space
+    void *dumb = malloc(data);
+    ret = ptrace(req, who, dumb, data);
+    if (ret == -1) {
+      ret = -errno;
+      failed = 1;
+    }
+    PTraceWriteBytes(pid, addr, dumb, data);
+    free(dumb);
+    goto intercept;
+  }
+  case PT_GETNUMLWPS:
+    goto use_host_ptrace;
+  case PT_GETLWPLIST:
+    goto read_style;
+  case PT_SETSTEP:
+  case PT_CLEARSTEP:
+  case PT_SUSPEND:
+  case PT_RESUME:
+  case PT_TO_SCE:
+  case PT_TO_SCX:
+  case PT_SYSCALL:
+    goto use_host_ptrace;
+  case PT_GET_SC_ARGS:
+  case PT_GET_SC_RET:
+    goto read_style;
+  case PT_VM_TIMESTAMP:
+  case PT_VM_ENTRY:
+    printf("unimpBM");
+    goto use_host_ptrace;
+    break;
+  case PT_COREDUMP:
+  case PT_SC_REMOTE:
+    goto read_style;
+  // X86 specific
+  // case PT_GETXMMREGS:
+  // case PT_GETXSTATE_INFO:
+  // case PT_SETXMMREGS:
+  case PT_SETXSTATE:
+  case PT_SETREGS:
+  case PT_SETFPREGS:
+  case PT_SETDBREGS:
+  case PT_SETGSBASE:
+  case PT_SETFSBASE: {
+  write_style:;
+    if (req == PT_SETREGS)
+      data = sizeof(struct reg);
+    else if (req == PT_SETFPREGS)
+      data = sizeof(struct fpreg);
+    else if (req == PT_SETDBREGS)
+      data = sizeof(struct dbreg);
+    else if (req == PT_SETFSBASE)
+      data = sizeof(unsigned long);
+    else if (req == PT_SETGSBASE)
+      data = sizeof(unsigned long);
+    // Read from poo poo tasks addres space
+    void *dumb = malloc(data);
+    PTraceRead(pid, dumb, addr, data);
+    ret = ptrace(req, who, dumb, data);
+    if (ret < 0) {
+      failed = 1;
+      ret = -errno;
+    }
+    free(dumb);
+    goto intercept;
+  }
+  default:
+  use_host_ptrace:
+    if (req == PT_READ_D || req == PT_READ_I)
+      ret = ptrace(req, who, addr, data);
+    else {
+      ret = ptrace(req, who, addr, data);
+    }
+  intercept:
+    ABISetSyscall(
+        pid, 20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+    ptrace(PT_TO_SCX, pid, (caddr_t)1, (SIGSTOP));
+    waitpid(pid, NULL, 0);
+    // I ran *getpid* instead of ptrace,that means RAX has pid
+    pinf = GetProcInfByPid(ABIGetReturn(pid, NULL));
+    ABISetReturn(pid, ret, failed);
+    break;
+  case PT_LWP_EVENTS:
+    GetProcInfByPid(who)->flags |= PIF_PTRACE_LWP_EVENTS;
+    goto intercept;
+    break;
+  case PT_FOLLOW_FORK: {
+    pinf = GetProcInfByPid(who);
+    pinf->flags |= PIF_PTRACE_FOLLOW_FORK;
+    pinf->debugged_by = pid;
+    goto intercept;
+  } break;
+  case PT_GET_EVENT_MASK: {
+    pinf = GetProcInfByPid(who);
+    ret = ptrace(PT_WRITE_D, pid, addr, pinf->ptrace_event_mask);
+    goto intercept;
+  } break;
+  case PT_SET_EVENT_MASK: {
+    pinf = GetProcInfByPid(who);
+    pinf->ptrace_event_mask = ptrace(PT_READ_D, pid, (caddr_t)addr, (int)addr);
+    goto intercept;
+  } break;
+  }
+}
+static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
+  CWaitEvent *wev;
+  for (wev = wait_events.next; wev != &wait_events; wev = wev->next) {
+    if (wev->to == pid) {
+      if (_idtype == 0) {
+        if (who == -1) { // Any child
+          return wev;
+        }
+        if (who == -1) { // Any child with same gpid
+          if (getpgid(wev->from) == getpgid(wev->to))
+            return wev;
+        }
+        if (who > 0) {
+          if (wev->from == who)
+            return wev;
+        }
+        if (who < -1) {
+          if (-wev->from == getpgid(who))
+            return wev;
+        }
+      }
+      if (_idtype == P_PID) {
+        if (who == 0) {
+          if (getpgid(wev->to) == getpgid(wev->from))
+            return wev;
+        } else if (wev->from == who)
+          return wev;
+      }
+      if (_idtype == P_PGID) {
+        if (who == 0) {
+          if (getpgid(wev->to) == getpgid(wev->from))
+            return wev;
+        } else if (getpgid(wev->from) == who)
+          return wev;
+      }
+      if (_idtype == P_ALL) {
+        return wev;
+      }
+    }
+  }
+  return NULL;
+}
+static void DiscardWait(pid_t pid, pid_t discard) {
+  bool failed;
+  int64_t oldr = ABIGetReturn(pid, &failed);
+  int64_t args4[4] = {discard, 0, 0, 0};
+  struct ptrace_sc_remote dummy;
+  dummy.pscr_args = &args4;
+  dummy.pscr_nargs = 4;
+  dummy.pscr_syscall = 7;
+  assert(0 == ptrace(PT_SC_REMOTE, pid, &dummy, sizeof(dummy)));
+  waitpid(pid, NULL, 0);
+  ABISetReturn(pid, oldr, failed);
+}
+static void UpdateWaits() {
+  CProcInfo *cur, *cur2;
+  CWaitEvent *wev;
+  struct ptrace_lwpinfo ptinf;
+  struct ptrace_lwpinfo inf;
+  int *write_code_to, who, wflags;
+  struct ptrace_sc_remote dummy;
+  int64_t args4[4];
+  for (cur = proc_head.last; cur != &proc_head; cur = cur->last) {
+    if (cur->flags & PIF_WAITING) {
+      ptrace(PT_LWPINFO, cur->pid, &inf, sizeof(inf));
+      // A safe-place to run PT_SC_REMOTE  is at syscall exit.
+      // Keep values before our "dumb" syscall
+      write_code_to = (int *)ABIGetArg(cur->pid, 1);
+      wflags = (int)ABIGetArg(cur->pid, 2);
+      who = (int)ABIGetArg(cur->pid, 0);
+      args4[0] = who;
+      args4[1] = (int64_t)write_code_to;
+      args4[2] = wflags | WNOHANG | WNOWAIT;
+      args4[3] = ABIGetArg(cur->pid, 3);
+      if (inf.pl_flags & PL_FLAG_SCE) {
+        // run a dummy syscall
+        ABISetSyscall(cur->pid, 20);
+        ptrace(PT_TO_SCX, cur->pid, (caddr_t)1, 0);
+        waitpid(cur->pid, NULL, 0);
+        ABISetReturn(cur->pid, 0, 0);
+      }
+    wait4:;
+      // Run a dummy WAIT with WNOHANG to check if a signal has come
+      // I have to insert "PTRACE" signals too
+      dummy.pscr_args = &args4;
+      dummy.pscr_nargs = 4;
+      dummy.pscr_syscall = 7;
+      assert(0 == ptrace(PT_SC_REMOTE, cur->pid, &dummy, sizeof(dummy)));
+      waitpid(cur->pid, NULL, 0);
+      ABISetArg(cur->pid, 0, args4[0]);
+      ABISetArg(cur->pid, 1, args4[1]);
+      ABISetArg(cur->pid, 2, wflags);
+      ABISetArg(cur->pid, 3, args4[3]);
+      if (wev = EventForWait(cur->pid, who, 0)) {
+        ptrace(PT_WRITE_D, cur->pid, write_code_to, wev->code);
+        ABISetReturn(cur->pid, wev->from, 0);
+        RemoveWaitEvent(wev);
+        cur->flags &= ~PIF_WAITING;
+        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+        goto next;
+      }
+      if (dummy.pscr_ret.sr_error != 0) {
+        // Syscalls return -errcode on error
+        // PT_SC_REMOTE deosnt put error in pscr_ret.sr_retval
+        cur->flags &= ~PIF_WAITING;
+        ABISetReturn(cur->pid, -dummy.pscr_ret.sr_error, 1);
+        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+      say_got:
+        if (write_code_to) {
+          int code = ptrace(PT_READ_D, cur->pid, write_code_to, 0);
+        }
+        goto next;
+      }
+      // Restore our regs?
+      if (dummy.pscr_ret.sr_retval[0] == -1) {
+        ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
+                     dummy.pscr_ret.sr_error);
+        // something went wrong
+        cur->flags &= ~PIF_WAITING;
+        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+        goto say_got;
+        goto next;
+      } else if (dummy.pscr_ret.sr_retval[0] != 0) {
+        DiscardWait(cur->pid,
+                    dummy.pscr_ret.sr_retval[0]); // EARILER I USED WNOWAIT
+        // Got a valid pid?
+        cur->flags &= ~PIF_WAITING;
+        ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
+                     dummy.pscr_ret.sr_error);
+        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+        goto say_got;
+        goto next;
+      }
+      // if WNOHANG was set,return as usale
+
+      if (wflags & WNOHANG) {
+        cur->flags &= ~PIF_WAITING;
+        ABISetReturn(cur->pid, 0, 0);
+        goto next;
+      }
+    }
+  next:;
+  }
+}
+static void DelegatePtraceEvent(pid_t to, pid_t who, int code) {
+  if (to != who) {
+    CWaitEvent *ev = calloc(1, sizeof(CWaitEvent)), *tmp;
+    ev->to = to;
+    ev->from = who;
+    ev->code = code;
+    ev->last = wait_events.last;
+    ev->next = &wait_events;
+    ev->next->last = ev;
+    ev->last->next = ev;
+  }
+  UpdateWaits();
+}
+static void InterceptWait(pid_t pid, int wait_for_type, int wait_for_id) {
+  CProcInfo *inf = GetProcInfByPid(pid);
+  inf->flags |= PIF_WAITING;
+  UpdateWaits();
+  return;
 }
 
 static int64_t NormailizePath(char *to, const char *path) {
@@ -201,17 +654,6 @@ static ptrdiff_t ReadPTraceString(char *to, pid_t pid, char *pt_ptr) {
     ret += readb;
   }
 }
-
-static void PTraceRestoreBytes(pid_t pid, void *pt_ptr, void *backup,
-                               size_t len) {
-  assert(PTraceWrite(pid, pt_ptr, backup, len) == len);
-}
-
-static void PTraceWriteBytes(pid_t pid, void *pt_ptr, const void *st,
-                             size_t len) {
-  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
-}
-
 static size_t WritePTraceString(void *backup, pid_t pid, void *pt_ptr,
                                 char const *st) {
   size_t len = strlen(st) + 1;
@@ -308,50 +750,50 @@ static void PTraceWritePtr(pid_t pid, void *at, void *ptr) {
   assert(PTraceWrite(pid, at, &ptr, 8) == 8);
 }
 static void *GetHackDataAreaForPid(pid_t pid) {
-	CProcInfo *pinf=GetProcInfByPid(pid);
-	return PTraceReadPtr(pid,&pinf->hacks_array_ptr->data_zone);
+  CProcInfo *pinf = GetProcInfByPid(pid);
+  return PTraceReadPtr(pid, &pinf->hacks_array_ptr->data_zone);
 }
-//Returns end of written data
-static char *RewriteEnv(pid_t pid,char **prog_env,char *data_ptr) {
-	int64_t idx,idx2,argc=0;
-	char *arg;
-	char val[4048];
-	char chrooted[4048],orig[4048],final[4048];
-	for(idx=0;arg=PTraceReadPtr(pid,prog_env+idx);idx++)
-	  argc++;
-	char *new_env_ptrs[argc];
-	for(idx=0;arg=PTraceReadPtr(pid,prog_env+idx);idx++) {
-		#define LD_LIBRARY_PATH_EQ "LD_LIBRARY_PATH="
-		ReadPTraceString(val,pid,arg);
-		if(!strncmp(LD_LIBRARY_PATH_EQ,val,strlen(LD_LIBRARY_PATH_EQ))) {
-			strcpy(final,LD_LIBRARY_PATH_EQ);
-			char *start=val+strlen(LD_LIBRARY_PATH_EQ),*end;
-again:
-			end=start;
-			while(*end&&*end!=':')
-			   end++;
-			orig[0]=0;
-			idx2=0;
-			while(start!=end) {
-				orig[idx2++]=*start++;
-			}
-			orig[idx2]=0;
-			GetChrootedPath(chrooted,pid,orig);
-			strcpy(final+strlen(final),chrooted);
-			if(*end==':') {
-				strcpy(final+strlen(final),":");
-				start=end+1;
-				goto again;
-			}
-			WritePTraceString(NULL,pid,data_ptr,final);
-			new_env_ptrs[idx]=data_ptr;
-			PTraceWritePtr(pid,new_env_ptrs[idx],prog_env+idx);
-			data_ptr+=strlen(final)+1;
-		} else {
-			new_env_ptrs[idx]=arg;
-		}
-	}
-	return data_ptr;
+// Returns end of written data
+static char *RewriteEnv(pid_t pid, char **prog_env, char *data_ptr) {
+  int64_t idx, idx2, argc = 0;
+  char *arg;
+  char val[4048];
+  char chrooted[4048], orig[4048], final[4048];
+  for (idx = 0; arg = PTraceReadPtr(pid, prog_env + idx); idx++)
+    argc++;
+  char *new_env_ptrs[argc];
+  for (idx = 0; arg = PTraceReadPtr(pid, prog_env + idx); idx++) {
+#define LD_LIBRARY_PATH_EQ "LD_LIBRARY_PATH="
+    ReadPTraceString(val, pid, arg);
+    if (!strncmp(LD_LIBRARY_PATH_EQ, val, strlen(LD_LIBRARY_PATH_EQ))) {
+      strcpy(final, LD_LIBRARY_PATH_EQ);
+      char *start = val + strlen(LD_LIBRARY_PATH_EQ), *end;
+    again:
+      end = start;
+      while (*end && *end != ':')
+        end++;
+      orig[0] = 0;
+      idx2 = 0;
+      while (start != end) {
+        orig[idx2++] = *start++;
+      }
+      orig[idx2] = 0;
+      GetChrootedPath(chrooted, pid, orig);
+      strcpy(final + strlen(final), chrooted);
+      if (*end == ':') {
+        strcpy(final + strlen(final), ":");
+        start = end + 1;
+        goto again;
+      }
+      WritePTraceString(NULL, pid, data_ptr, final);
+      new_env_ptrs[idx] = data_ptr;
+      PTraceWritePtr(pid, new_env_ptrs[idx], prog_env + idx);
+      data_ptr += strlen(final) + 1;
+    } else {
+      new_env_ptrs[idx] = arg;
+    }
+  }
+  return data_ptr;
 }
 static void InterceptExecve(pid_t pid) {
   char have_str[1024], chroot[1024], backup[1024], poop_ant[1024];
@@ -359,7 +801,7 @@ static void InterceptExecve(pid_t pid) {
   char *ptr, *ptr2, *command, *argument;
   int64_t fd, args[3], bulen, extra_args = 0;
   struct ptrace_sc_remote rmt;
-  CProcInfo *pinf=GetProcInfByPid(pid);
+  CProcInfo *pinf = GetProcInfByPid(pid);
   orig_ptr = (void *)ABIGetArg(pid, 0);
   argv = (void *)ABIGetArg(pid, 1);
   env = (void *)ABIGetArg(pid, 2);
@@ -367,11 +809,11 @@ static void InterceptExecve(pid_t pid) {
   GetChrootedPath(chroot, pid, have_str);
   memset(poop_ant, 0, sizeof(poop_ant));
   if (!CheckShebang(chroot, poop_ant)) {
-	  char *tmp1,*tmp2;
+    char *tmp1, *tmp2;
     // exeve(open(chrooted),argv,env)
-    ABISetSyscall(pid, 5); //iopen
+    ABISetSyscall(pid, 5); // iopen
     ABISetArg(pid, 1, O_EXEC);
-    ReadPTraceString(poop_ant,pid,orig_ptr);
+    ReadPTraceString(poop_ant, pid, orig_ptr);
     GetChrootedPath(chroot, pid, poop_ant);
     bulen = WritePTraceString(backup, pid, orig_ptr, chroot);
     ptrace(PT_TO_SCX, pid, (void *)1, 0);
@@ -383,7 +825,7 @@ static void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    RewriteEnv(pid,env,GetHackDataAreaForPid(pid));
+    RewriteEnv(pid, env, GetHackDataAreaForPid(pid));
     ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   } else {
     char *extra_arg_ptrs[256];
@@ -401,9 +843,10 @@ static void InterceptExecve(pid_t pid) {
     waitpid(pid, NULL, 0);
 
     PTraceRestoreBytes(pid, orig_ptr, backup, bulen);
-    // Insert the pointer to the command name before argv(I will dump the name
-    // to NULL,it doesnt matter as we will change the program image at fexecve)
-    ptr=GetHackDataAreaForPid(pid);
+    // Insert the pointer to the command name before argv(I will dump the
+    // name to NULL,it doesnt matter as we will change the program image at
+    // fexecve)
+    ptr = GetHackDataAreaForPid(pid);
     extra_args = 0;
     WritePTraceString(NULL, pid, ptr, command);
     extra_arg_ptrs[extra_args++] = ptr;
@@ -437,8 +880,8 @@ static void InterceptExecve(pid_t pid) {
       ReadPTraceString(have_str, pid, extra_arg_ptrs[fd]);
     }
 
-    // The first argument to the argv is the program name,but we delegated it to
-    // the interrepter REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY
+    // The first argument to the argv is the program name,but we delegated
+    // it to the interrepter REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY
     while (PTraceReadPtr(pid, argv + fd)) {
       PTraceWritePtr(pid, argv + fd, PTraceReadPtr(pid, argv + fd + 1));
       fd++;
@@ -450,31 +893,9 @@ static void InterceptExecve(pid_t pid) {
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    RewriteEnv(pid,env,ptr);
+    RewriteEnv(pid, env, ptr);
     ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
   }
-}
-
-static int64_t UnChrootPath(char *to, char *from) {
-  char buf[1024], *cur = buf;
-  CMountPoint *mp, *best = root_mount;
-  int64_t trim, best_len = 0xffff, len;
-  for (mp = mount_head.next; mp != &mount_head; mp = mp->next) {
-    len = strlen(mp->dst_path);
-    if (!strncmp(from, mp->dst_path, len)) {
-      if (best_len < len) {
-        best_len = len;
-        best = mp;
-      }
-    }
-  }
-
-  trim = strlen(best->dst_path);
-  *cur++ = '/';
-  StrMove(cur, from + trim);
-  if (to)
-    strcpy(to, buf);
-  return strlen(buf);
 }
 
 static void InterceptReadlink(pid_t pid) {
@@ -611,8 +1032,8 @@ static void InterceptAccessShmUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 static void InterceptAccessTruncate(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
 
 static void InterceptFstat(pid_t pid) {
-  // makes the file look like it was made by root (TODO enable/disable this from
-  // command line)
+  // makes the file look like it was made by root (TODO enable/disable this
+  // from command line)
   uint8_t *ptr = (void *)ABIGetArg(pid, 1);
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
   waitpid(pid, NULL, 0);
@@ -623,8 +1044,8 @@ static void InterceptFstat(pid_t pid) {
 }
 
 static void InterceptFhstat(pid_t pid) {
-  // makes the file look like it was made by root (TODO enable/disable this from
-  // command line)
+  // makes the file look like it was made by root (TODO enable/disable this
+  // from command line)
   char *ptr = (void *)ABIGetArg(pid, 1);
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
   waitpid(pid, NULL, 0);
@@ -633,8 +1054,8 @@ static void InterceptFhstat(pid_t pid) {
 }
 
 static void InterceptFstatat(pid_t pid) {
-  // makes the file look like it was made by root (TODO enable/disable this from
-  // command line)
+  // makes the file look like it was made by root (TODO enable/disable this
+  // from command line)
   char *ptr = (void *)ABIGetArg(pid, 2);
   INTERCEPT_FILE1_ONLY_ABS(pid, 1);
   W(ptr, struct stat, st_uid);
@@ -648,6 +1069,16 @@ static void FakeGroup(pid_t pid) {
   ABISetReturn(pid, 0, 0);
 }
 
+static CMountPoint *AddMountPoint(const char *dst, const char *src) {
+  CMountPoint *mp = malloc(sizeof *mp);
+  strcpy(mp->src_path, src);
+  realpath(dst, mp->dst_path);
+  mp->next = mount_head.next;
+  mp->last = &mount_head;
+  mp->next->last = mp;
+  mp->last->next = mp;
+  return mp;
+}
 static void FakeUser(pid_t pid) {
   ptrace(PT_TO_SCX, pid, (void *)1, 0);
   waitpid(pid, 0, 0);
@@ -677,38 +1108,85 @@ int main(int argc, const char **argv, const char **env) {
   mount_head.last = &mount_head;
   mount_head.next = &mount_head;
 
+  wait_events.last = &wait_events;
+  wait_events.next = &wait_events;
+
   root_mount = AddMountPoint(argv[1], "/");
   AddMountPoint("/dev", "/dev");
+  AddMountPoint("/proc", "/proc");
 
   if ((pid = fork())) {
     int cond;
-    while ((pid2 = waitpid(-1, &cond, WUNTRACED))) {
+    while ((pid2 = waitpid(-1, &cond,
+                           WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
+                               WCONTINUED))) {
+      printf("SIG:%d,%d\n",pid2,WTERMSIG(cond));*/
       if (WIFEXITED(cond) && pid2 == pid)
         exit(0);
       struct ptrace_lwpinfo inf;
+      CProcInfo *pinf = GetProcInfByPid(pid2);
       ptrace(PT_LWPINFO, pid2, (caddr_t)&inf, sizeof inf);
+      ptrace(PT_FOLLOW_FORK, pid2, NULL, 1);
       if (WIFEXITED(cond)) {
+        DelegatePtraceEvent(pinf->parent, pid2, cond);
+        pid_t par = pinf->parent;
+        pinf->flags |= PIF_EXITED;
+        RemoveProc(pid2);
         continue;
       } else if (WIFSIGNALED(cond)) {
-        ptrace(PT_CONTINUE, pid2, (void *)1, WTERMSIG(cond));
-        continue;
-      } else if (WIFSTOPPED(cond)) {
-        // I probably did this(ptrace did it)
-        if (WSTOPSIG(cond) == SIGTRAP)
-          goto normal;
-        // Also from ptrace probably
-        if (WSTOPSIG(cond) == SIGSTOP)
-          goto normal;
-        ptrace(PT_CONTINUE, pid2, (void *)1, WSTOPSIG(cond));
-        continue;
+        if (1) {
+          DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
+          if (pinf->debugged_by) {
+          } else {
+            ptrace(PT_CONTINUE, pid2, (void *)1, 0);
+            RemoveProc(pid2);
+          }
+          UpdateWaits();
+          continue;
+        }
+      }
+      // Nested ptrace,delegate poo poo sauce to the "simulated" ptrace if
+      // we are being debugged;
+      {
+        CProcInfo *pinf2;
+        if (pinf->debugged_by || (pinf->flags & PIF_TRACE_ME)) {
+          pid_t to = pinf->debugged_by;
+          if (!to)
+            to = pinf->parent;
+          if (pinf->ptrace_event_mask &
+              (inf.pl_flags & ~(PL_FLAG_SCE | PL_FLAG_SCX))) {
+          send_out:;
+            DelegatePtraceEvent(to, pid2, cond);
+            kill(to, SIGCHLD);
+            // Heres the DEAL.PT_TRACE_ME sets the PTRACE_EXEC flag in the
+            // ptrace state(not reset when used)
+            UpdateWaits();
+            continue;
+          }
+        }
       }
     normal:
-      ptrace(PT_FOLLOW_FORK, pid2, NULL, 1);
-      if (inf.pl_flags & PL_FLAG_FORKED) {
-		  //Inheret our hacks from LD_PRELOAD hack
-        GetProcInfByPid(inf.pl_child_pid)->hacks_array_ptr=GetProcInfByPid(pid2)->hacks_array_ptr;
-	  }
-      if (inf.pl_flags & PL_FLAG_CHILD) {
+      if (inf.pl_flags & PL_FLAG_EXITED) {
+        UpdateWaits();
+        // DelegatePtraceEvent
+        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        continue;
+      }
+      if (inf.pl_flags & (PL_FLAG_BORN | PL_FLAG_EXEC)) {
+        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        continue;
+      } else if (inf.pl_flags &
+                 (PL_FLAG_FORKED | PL_FLAG_VFORKED | PL_FLAG_VFORK_DONE)) {
+        // Inheret our hacks from LD_PRELOAD hack
+        CProcInfo *parent = pinf;
+        CProcInfo *child = GetProcInfByPid(inf.pl_child_pid);
+        child->parent = pid2;
+        child->hacks_array_ptr = parent->hacks_array_ptr;
+        // Born again?
+        parent->flags &= ~PIF_EXITED;
+        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        continue;
+      } else if (inf.pl_flags & PL_FLAG_CHILD) {
         struct ptrace_sc_remote rmt;
         int64_t args[1];
         args[0] = 0; // root
@@ -725,29 +1203,32 @@ int main(int argc, const char **argv, const char **env) {
         ptrace(PT_SC_REMOTE, pid2, (caddr_t)&rmt, sizeof(rmt));
         ptrace(PT_TO_SCX, pid2, (void *)1, 0);
         waitpid(pid2, NULL, 0);
-      }
-      if (inf.pl_flags & PL_FLAG_SCE) {
+        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        continue;
+      } else if (inf.pl_flags & PL_FLAG_SCE) {
         switch (inf.pl_syscall_code) {
-		case MR_CHROOT_NOSYS: {
-			char chrooted[1024];
-			//In preload_hack.c,I use an indrtiect syscall,so use argument 1 instead of 0
-			CProcInfo *pinf=GetProcInfByPid(pid2);
-			pinf->hacks_array_ptr=(CMrChrootHackPtrs*)ABIGetArg(pid2,1);
-			
-		    char *write_chroot_to=(char*)ABIGetArg(pid2,2);
-		    ReadPTraceString(chrooted,pid2,write_chroot_to);
-		    GetChrootedPath(chrooted,pid2,"/");		    
-		    PTraceWriteBytes(pid2, write_chroot_to, chrooted, strlen(chrooted) + 1);
-		    ABISetSyscall(pid2,36); //Sync Takes no arguments,repalce with valid syscall(to avoid a signal for invalid syscall)
-		    ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-			waitpid(pid2, NULL, 0);
-		  }
-		  break;
+        case MR_CHROOT_NOSYS: {
+          char chrooted[1024];
+          // In preload_hack.c,I use an indrtiect syscall,so use argument 1
+          // instead of 0
+          pinf->hacks_array_ptr = (CMrChrootHackPtrs *)ABIGetArg(pid2, 1);
+
+          char *write_chroot_to = (char *)ABIGetArg(pid2, 2);
+          ReadPTraceString(chrooted, pid2, write_chroot_to);
+          GetChrootedPath(chrooted, pid2, "/");
+          PTraceWriteBytes(pid2, write_chroot_to, chrooted,
+                           strlen(chrooted) + 1);
+          ABISetSyscall(pid2,
+                        36); // Sync Takes no arguments,repalce with valid
+                             // syscall(to avoid a signal for invalid syscall)
+          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
+          waitpid(pid2, NULL, 0);
+        } break;
+        case 0: // syscall
+          break;
         case 1: // exit
-          ptrace(PT_DETACH, pid2, NULL, 0);
           break;
         case 2: // fork
-        
           break;
         case 3: // read
           break;
@@ -758,7 +1239,11 @@ int main(int argc, const char **argv, const char **env) {
           break;
         case 6: // close
           break;
-        case 7: // fork
+        case 7: // wait4
+          InterceptWait(pid2, ABIGetArg(pid2, 0), 0);
+          break;
+        case 532: // wait6
+          InterceptWait(pid2, ABIGetArg(pid2, 1), 0);
           break;
         case 9: // link
           InterceptLink(pid2);
@@ -787,6 +1272,9 @@ int main(int argc, const char **argv, const char **env) {
           break;
         case 25: // geteuid
           FakeUser(pid2);
+          break;
+        case 26: // ptrace
+          InterceptPtrace(pid2);
           break;
         case 33: // access
           InterceptAccess(pid2);
@@ -828,6 +1316,9 @@ int main(int argc, const char **argv, const char **env) {
           InterceptExecve(pid2);
           break;
         case 61: // chroot TODO
+          break;
+        case 66:
+          break;
         case 73: // munmap
           break;
         case 74: // mprotect
@@ -973,7 +1464,8 @@ int main(int argc, const char **argv, const char **env) {
         case 503: {
           if (inf.pl_syscall_code == 492) {
           } else {
-            INTERCEPT_FILE1_ONLY_ABS(pid2, 1); // This exits the syscall for us
+            INTERCEPT_FILE1_ONLY_ABS(pid2,
+                                     1); // This exits the syscall for us
             // TODO check if "root"
             if (inf.pl_syscall_code == 490 || inf.pl_syscall_code == 491)
               ABISetReturn(pid2, 0, 0);
@@ -1098,11 +1590,40 @@ int main(int argc, const char **argv, const char **env) {
         case 574: // realpathat
         {
           InterceptRealPathAt(pid2);
+          break;
         }
         default:;
         }
+        goto defacto;
+      } else {
+      defacto:
+        if (pinf->flags & PIF_TO_SCX_ONLY) {
+          pinf->flags &= ~PIF_TO_SCX_ONLY;
+          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
+          continue;
+        }
+        if (!(pinf->flags & PIF_WAITING)) {
+          if (WIFSTOPPED(cond)) {
+            if (WSTOPSIG(cond) != SIGTRAP || pinf->debugged_by) {
+              pid_t debugged_by = pinf->debugged_by;
+              if (!debugged_by) {
+                ptrace(PT_TO_SCE, pid2, (void *)1, WSTOPSIG(cond)); // !=SIGTAP
+              } else if (debugged_by) {
+                if (WSTOPSIG(cond) == SIGTRAP &&
+                    !!(inf.pl_flags & (PL_FLAG_SCE | PL_FLAG_SCX))) {
+                  goto ignore;
+                }
+                DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
+                kill(debugged_by, SIGCHLD);
+              }
+              UpdateWaits();
+              continue;
+            }
+          }
+        ignore:;
+          ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        }
       }
-      ptrace(PT_TO_SCE, pid2, (void *)1, 0);
     }
   } else {
     const char *dummy_argv[argc - 3 + 1 + 1];
@@ -1123,7 +1644,7 @@ int main(int argc, const char **argv, const char **env) {
     }
     struct stat fst;
     fstat(f, &fst);
-    char *chroot_root=realpath(argv[1],NULL);
+    char *chroot_root = realpath(argv[1], NULL);
     chdir(argv[1]);
     if (access(DLLNAME, F_OK)) {
       struct stat fst;
@@ -1145,7 +1666,7 @@ int main(int argc, const char **argv, const char **env) {
     char *nenv[256];
     has_ld_preload = 0;
     for (r = 0; env[r]; r++) {
-      if (Startswith(env[r], "LD_PRELOAD=")) {
+      if (Startswith(env[r], "LD_PRELOAD=") && 0) {
         has_ld_preload = 1;
         snprintf(nenv_d[r], sizeof *nenv_d, "%s %s", env[r], "/" DLLNAME);
       } else
@@ -1153,11 +1674,11 @@ int main(int argc, const char **argv, const char **env) {
       nenv[r] = nenv_d[r];
     }
     if (!has_ld_preload) {
-      strcpy(nenv_d[r], "LD_PRELOAD=/" DLLNAME);
+      sprintf(nenv_d[r], "LD_PRELOAD=/%s", DLLNAME);
       nenv[r] = nenv_d[r];
       r++;
     }
-    nenv[r]="LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
+    nenv[r] = "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
     r++;
     nenv[r] = NULL;
     execve(chroot_bin, dummy_argv, nenv);
