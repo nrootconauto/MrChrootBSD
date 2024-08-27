@@ -1120,7 +1120,7 @@ int main(int argc, const char **argv, const char **env) {
     while ((pid2 = waitpid(-1, &cond,
                            WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
                                WCONTINUED))) {
-      printf("SIG:%d,%d\n",pid2,WTERMSIG(cond));*/
+      /*printf("SIG:%d,%d\n",pid2,WTERMSIG(cond));*/
       if (WIFEXITED(cond) && pid2 == pid)
         exit(0);
       struct ptrace_lwpinfo inf;
