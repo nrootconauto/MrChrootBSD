@@ -127,7 +127,7 @@ static int64_t FdToStr(char *to, pid_t pid,int fd) {
   for (unsigned i = 0; i < cnt; i++) {
     head = procstat_getfiles(ps, kprocs, 0);
     STAILQ_FOREACH(fs, head, next) {
-      if (fs->fs_fd==fd) {
+      if (fs->fs_fd==fd&&fs->fs_path) {
         res_cnt = UnChrootPath(buf, fs->fs_path);
         if (to)
           strcpy(to, buf);
@@ -1096,6 +1096,7 @@ static void InterceptChmod(pid_t pid) {
   ReadPTraceString(have, pid, (char *)ABIGetArg(pid, 0));
   { INTERCEPT_FILE1(pid, 0); }
   // TODO PERM CHECK
+  ABISetReturn(pid,0,0);
 }
 
 static void InterceptSetuid(pid_t pid) {
@@ -1763,6 +1764,7 @@ int main(int argc, const char **argv, const char **env) {
         {
           char dst[1024];
           AtSytle(dst, pid2, 0, 1);
+          ABISetReturn(pid2,0,0);
           break;
         }
         case 491: { // fchownat
@@ -1773,7 +1775,6 @@ int main(int argc, const char **argv, const char **env) {
           if (FdToStr(dst,pid2, ABIGetArg(pid2, 0))) {
               HashTableSet(dst, ABIGetArg(pid2, 1), ABIGetArg(pid2, 2),FilePerms(dst));
           }
-          FakeSuccess(pid2);
           break;
         }
         case 492:
