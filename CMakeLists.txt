@@ -4,7 +4,8 @@ project(mrchroot
 add_executable(${PROJECT_NAME}
   main.c
   ptrace.c ptrace.h
-  abi.c abi.h)
+  abi.c abi.h
+  hash.c hash.h)
 add_library(pl_hack SHARED
   preload_hack.c)
 set_target_properties(${PROJECT_NAME} pl_hack
@@ -17,6 +18,6 @@ set_target_properties(${PROJECT_NAME} pl_hack
 target_link_libraries(pl_hack PRIVATE dl)
 target_link_libraries(mrchroot PRIVATE procstat)
 
-set(FLAGS -Wall -Wextra -fno-stack-protector -fno-strict-aliasing)
+set(FLAGS -w -fno-stack-protector -fno-strict-aliasing)
 target_compile_options(mrchroot PRIVATE ${FLAGS})
 target_compile_options(pl_hack PRIVATE ${FLAGS})
