@@ -12,3 +12,4 @@ void HashTableSet(const char *fn,uid_t u,gid_t g,uint32_t perms);
 CHashEntry *HashTableGet(CHashEntry *e,const char *fn);
 void HashTableRemove(const char *fn);
 void HashTableInit(const char *fn);
+void HashTableDone() ;
