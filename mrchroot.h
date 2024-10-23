@@ -15,4 +15,4 @@ class (CMountPoint) {
   char document_perms;
 };
 //May return NULL if the path is not to be documented
-extern char *DatabasePathForFile(char *to, pid_t pid, const char *path);
+extern char *DatabasePathForFile(char *to, const char *path);

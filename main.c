@@ -1,4 +1,3 @@
-
 #include "abi.h"
 #include "hash.h"
 #include "mrchroot.h"
@@ -12,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/procctl.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -26,16 +26,39 @@
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
+static int64_t ProcIsAlive(pid_t);
 static int ptrace2(int a,pid_t p,void *add ,int d) {
 	int r=ptrace(a,p,add,d);
+	//if(r) printf("%d,%d,%d\n",a,p,errno);
 	return r;
 }
 #define assert(f) if(!(f)) {fprintf(stderr,"Failure at " __FILE__  "(%d). Your on your own!!!\n",__LINE__); abort();}
+static pid_t mc_current_pid;
+static int mc_current_tid; //LWP id
+static void ToScx() {
+	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
+	waitpid(mc_current_pid,NULL,0);
+}
+static void SetArg(int64_t a,int64_t v) {
+	ABISetArg(mc_current_tid,a,v);
+}
+static int64_t GetArg(int64_t a) {
+	return ABIGetArg(mc_current_tid,a);
+}
+static void SetReturn(int64_t e,int64_t fu) {
+	ABISetReturn(mc_current_tid,e,fu);
+}
+static void SetSyscall(int64_t sc) {
+	ABISetSyscall(mc_current_tid,sc);
+}
+static int64_t GetReturn(char *fail) {
+	return ABIGetReturn(mc_current_tid,fail);
+}
+
 // Fakes a succeffusl return
-static void FakeSuccess(pid_t pid) {
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, 0, 0);
-  ABISetReturn(pid, 0, 0);
+static void FakeSuccess() {
+	ToScx();
+  SetReturn(0, 0);
 }
 #define ptrace ptrace2
 CMountPoint mount_head, *root_mount;
@@ -43,6 +66,12 @@ class (CWaitEvent) {
 	CWaitEvent *last,*next;
 	int code;
 	pid_t to,from;
+	/* See wait4(2)
+	 * Used wih P_UID/P_GID/P_SID
+	 */
+	uid_t uid;
+	gid_t gid;
+	gid_t sid;
 	siginfo_t siginf;
 } wait_events;
 #define PIF_WAITING 1
@@ -116,39 +145,43 @@ static int64_t UnChrootPath(char *to, char *from) {
     strcpy(to, buf);
   return strlen(buf);
 }
-static struct procstat *ps;
-static int64_t GetProcCwd(char *to, pid_t pid);
-static int64_t FdToStr(char *to, pid_t pid, int fd) {
+static struct procstat *ps = NULL;
+static int64_t GetProcCwd(char *to);
+static int64_t FdToStr(char *to, int fd) {
   unsigned cnt = 0;
   int64_t res_cnt = 0;
   char buf[1024];
   if (fd == AT_FDCWD) {
-    return GetProcCwd(to, pid);
+    return GetProcCwd(to);
   }
   if (!ps)
     ps = procstat_open_sysctl();
   struct filestat_list *head;
   // See /usr/src/use.bin/procstat in FreeBSD
   struct filestat *fs;
-  struct kinfo_proc *kprocs = procstat_getprocs(ps, KERN_PROC_PID, pid, &cnt);
+  struct kinfo_proc *kprocs =
+      procstat_getprocs(ps, KERN_PROC_PID, mc_current_pid, &cnt);
   for (unsigned i = 0; i < cnt; i++) {
     head = procstat_getfiles(ps, kprocs, 0);
-    STAILQ_FOREACH(fs, head, next) {
-      if (fs->fs_fd == fd && fs->fs_path) {
-        res_cnt = UnChrootPath(buf, fs->fs_path);
-        if (to)
-          strcpy(to, buf);
-        break;
+    if (head) {
+      STAILQ_FOREACH(fs, head, next) {
+        if (fs->fs_fd == fd && fs->fs_path) {
+          res_cnt = UnChrootPath(buf, fs->fs_path);
+          if (to)
+            strcpy(to, buf);
+          break;
+        }
       }
+      procstat_freefiles(ps, head);
     }
-    procstat_freefiles(ps, head);
   }
   procstat_freeprocs(ps, kprocs);
   return res_cnt;
 }
 
-static int64_t GetProcCwd(char *to, pid_t pid) {
+static int64_t GetProcCwd(char *to) {
   unsigned cnt = 0;
+  pid_t pid = mc_current_pid;
   int64_t res_cnt = 0;
   char buf[1024];
   if (!ps)
@@ -159,27 +192,27 @@ static int64_t GetProcCwd(char *to, pid_t pid) {
   struct kinfo_proc *kprocs = procstat_getprocs(ps, KERN_PROC_PID, pid, &cnt);
   for (unsigned i = 0; i < cnt; i++) {
     head = procstat_getfiles(ps, kprocs, 0);
-    STAILQ_FOREACH(fs, head, next) {
-      if (fs->fs_path && fs->fs_uflags & PS_FST_UFLAG_CDIR) {
-        res_cnt = UnChrootPath(buf, fs->fs_path);
-        if (to)
-          strcpy(to, buf);
-        break;
+    if (head) {
+      STAILQ_FOREACH(fs, head, next) {
+        if (fs->fs_path && fs->fs_uflags & PS_FST_UFLAG_CDIR) {
+          res_cnt = UnChrootPath(buf, fs->fs_path);
+          if (to)
+            strcpy(to, buf);
+          break;
+        }
       }
+      procstat_freefiles(ps, head);
     }
-    procstat_freefiles(ps, head);
   }
   procstat_freeprocs(ps, kprocs);
   return res_cnt;
 }
-static void PTraceRestoreBytes(pid_t pid, void *pt_ptr, void *backup,
-                               size_t len) {
-  assert(PTraceWrite(pid, pt_ptr, backup, len) == len);
+static void PTraceRestoreBytes(void *pt_ptr, void *backup, size_t len) {
+  assert(PTraceWrite(mc_current_pid, pt_ptr, backup, len) == len);
 }
 
-static void PTraceWriteBytes(pid_t pid, void *pt_ptr, const void *st,
-                             size_t len) {
-  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
+static void PTraceWriteBytes(void *pt_ptr, const void *st, size_t len) {
+  assert(PTraceWrite(mc_current_pid, pt_ptr, st, len) == len);
 }
 
 #define declval(T) (*(T *)0ul)
@@ -193,21 +226,19 @@ static CProcInfo *GetProcInfByPid(pid_t pid) {
   *(cur = calloc(sizeof(*cur), 1)) = (CProcInfo){.next = &proc_head,
                                                  .last = proc_head.last,
                                                  .pid = pid,
+                                                 .pid = pid,
                                                  .ptrace_event_mask = -1};
   return cur->last->next   //
          = cur->next->last //
          = cur;
 }
 
-static int64_t PidIsValid(pid_t pid) {
+static int64_t ProcIsAlive(pid_t pid) {
   CProcInfo *cur;
-  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
-    if (pid == cur->pid)
-      return 1;
-  }
-  return 0;
+  if (-1 == getpgid(pid))
+    return 0;
+  return 1;
 }
-
 static void RemoveWaitEvent(CWaitEvent *ev) {
   CWaitEvent *last = ev->last;
   CWaitEvent *next = ev->next;
@@ -246,22 +277,22 @@ static int64_t IsChildProc(pid_t child, pid_t parent) {
     return 1;
   return IsChildProc(cinf->parent, parent);
 }
-static void InterceptPtrace(pid_t pid) {
-  int req = ABIGetArg(pid, 0);
-  pid_t who = ABIGetArg(pid, 1);
-  void *addr = (void *)ABIGetArg(pid, 2);
-  int64_t data = ABIGetArg(pid, 3), ret = 0;
+static void InterceptPtrace() {
+  pid_t pid = mc_current_pid;
+  int req = GetArg(0);
+  pid_t who = GetArg(1);
+  void *addr = (void *)GetArg(2);
+  int64_t data = GetArg(3), ret = 0;
   CProcInfo *pinf;
   int failed = 0;
   GetProcInfByPid(who)->debugged_by = pid;
   switch (req) {
   case PT_TRACE_ME:
     pinf = GetProcInfByPid(pid);
-    ABISetSyscall(
-        pid, 20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
-    ptrace(PT_TO_SCX, pid, (caddr_t)1, 0);
-    waitpid(pid, NULL, 0);
-    ABISetReturn(pid, 0, NULL);
+    SetSyscall(
+        20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+    ToScx();
+    SetReturn(0, 0);
     pinf->flags |= PIF_TRACE_ME;
     pinf->ptrace_event_mask = PL_FLAG_EXEC;
     break;
@@ -338,7 +369,7 @@ static void InterceptPtrace(pid_t pid) {
       ret = -errno;
       failed = 1;
     }
-    PTraceWriteBytes(pid, addr, dumb, data);
+    PTraceWriteBytes(addr, dumb, data);
     free(dumb);
     goto intercept;
   }
@@ -404,13 +435,12 @@ static void InterceptPtrace(pid_t pid) {
       ret = ptrace(req, who, addr, data);
     }
   intercept:
-    ABISetSyscall(
-        pid, 20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
-    ptrace(PT_TO_SCX, pid, (caddr_t)1, (SIGSTOP));
-    waitpid(pid, NULL, 0);
+    SetSyscall(
+        20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+    ToScx();
     // I ran *getpid* instead of ptrace,that means RAX has pid
-    pinf = GetProcInfByPid(ABIGetReturn(pid, NULL));
-    ABISetReturn(pid, ret, failed);
+    pinf = GetProcInfByPid(GetReturn(NULL));
+    SetReturn(ret, failed);
     break;
   case PT_LWP_EVENTS:
     GetProcInfByPid(who)->flags |= PIF_PTRACE_LWP_EVENTS;
@@ -457,20 +487,33 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
       }
       if (_idtype == P_PID) {
         if (who == 0) {
-          if (getpgid(wev->to) == getpgid(wev->from))
+          if (getpgid(who) == getpgid(wev->from))
             return wev;
         } else if (wev->from == who)
           return wev;
       }
       if (_idtype == P_PGID) {
         if (who == 0) {
-          if (getpgid(wev->to) == getpgid(wev->from))
+          if (getpgid(who) == getpgid(wev->from))
             return wev;
         } else if (getpgid(wev->from) == who)
           return wev;
       }
       if (_idtype == P_ALL) {
-        return wev;
+        if (wev->to == who)
+          return wev;
+      }
+      if (_idtype == P_SID) {
+        if (wev->sid == who)
+          return wev;
+      }
+      if (_idtype == P_GID) {
+        if (wev->gid == who)
+          return wev;
+      }
+      if (_idtype == P_UID) {
+        if (wev->uid == who)
+          return wev;
       }
     }
   }
@@ -478,15 +521,15 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
 }
 static void DiscardWait(pid_t pid, pid_t discard) {
   bool failed;
-  int64_t oldr = ABIGetReturn(pid, &failed);
+  int64_t oldr = GetReturn(&failed);
   int64_t args4[4] = {discard, 0, 0, 0};
-  struct ptrace_sc_remote dummy;
+  struct ptrace_sc_remote dummy = {0};
   dummy.pscr_args = &args4;
   dummy.pscr_nargs = 4;
   dummy.pscr_syscall = 7;
   assert(0 == ptrace(PT_SC_REMOTE, pid, &dummy, sizeof(dummy)));
   waitpid(pid, NULL, 0);
-  ABISetReturn(pid, oldr, failed);
+  SetReturn(oldr, failed);
 }
 static void UpdateWaits() {
   CProcInfo *cur, *cur2;
@@ -532,7 +575,6 @@ static void UpdateWaits() {
         ABISetReturn(cur->pid, wev->from, 0);
         RemoveWaitEvent(wev);
         cur->flags &= ~PIF_WAITING;
-        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
         goto next;
       }
       if (dummy.pscr_ret.sr_error != 0) {
@@ -540,7 +582,6 @@ static void UpdateWaits() {
         // PT_SC_REMOTE deosnt put error in pscr_ret.sr_retval
         cur->flags &= ~PIF_WAITING;
         ABISetReturn(cur->pid, -dummy.pscr_ret.sr_error, 1);
-        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
       say_got:
         if (write_code_to) {
           int code = ptrace(PT_READ_D, cur->pid, write_code_to, 0);
@@ -553,7 +594,6 @@ static void UpdateWaits() {
                      dummy.pscr_ret.sr_error);
         // something went wrong
         cur->flags &= ~PIF_WAITING;
-        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
         goto say_got;
         goto next;
       } else if (dummy.pscr_ret.sr_retval[0] != 0) {
@@ -563,7 +603,6 @@ static void UpdateWaits() {
         cur->flags &= ~PIF_WAITING;
         ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
-        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
         goto say_got;
         goto next;
       }
@@ -574,28 +613,38 @@ static void UpdateWaits() {
         ABISetReturn(cur->pid, 0, 0);
         goto next;
       }
+    next:;
+      if (!(cur->flags & PIF_WAITING)) {
+        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+      }
     }
-  next:;
   }
 }
 static void DelegatePtraceEvent(pid_t to, pid_t who, int code) {
   if (to != who) {
     CWaitEvent *ev = calloc(1, sizeof(CWaitEvent)), *tmp;
+    CProcInfo *inf = GetProcInfByPid(who);
     ev->to = to;
     ev->from = who;
     ev->code = code;
+    ev->uid = inf->euid;
+    ev->gid = inf->egid;
+    ev->sid = getsid(who);
     ev->last = wait_events.last;
     ev->next = &wait_events;
     ev->next->last = ev;
     ev->last->next = ev;
+
+    //printf("KILL:%d,%d,%d\n", who, WTERMSIG(code), WSTOPSIG(code));
   }
   UpdateWaits();
 }
-static void InterceptWait(pid_t pid, int wait_for_type, int wait_for_id) {
-  CProcInfo *inf = GetProcInfByPid(pid);
+// Returns 1 if unpaused,else 0
+static int InterceptWait(int wait_for_type, int wait_for_id) {
+  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
   inf->flags |= PIF_WAITING;
   UpdateWaits();
-  return;
+  return !!(inf->flags & PIF_WAITING);
 }
 
 int64_t NormailizePath(char *to, const char *path) {
@@ -622,8 +671,9 @@ int64_t NormailizePath(char *to, const char *path) {
     strcpy(to, result);
   return strlen(result);
 }
-static int64_t GetChrootedPath0(char *to, pid_t pid, const char *path,
+static int64_t GetChrootedPath0(char *to, const char *path,
                                 CMountPoint **have_mp) {
+  pid_t pid = mc_current_pid;
   int64_t idx;
   size_t max_match = 0, len;
   char result[1024];
@@ -635,7 +685,7 @@ static int64_t GetChrootedPath0(char *to, pid_t pid, const char *path,
   if (*path == '/')
     strcpy(result, "/");
   else {
-    GetProcCwd(result, pid);
+    GetProcCwd(result);
     strcat(result, "/");
   }
   strcat(result, path);
@@ -671,22 +721,22 @@ static int64_t GetChrootedPath0(char *to, pid_t pid, const char *path,
     strcpy(to, s);
   return strlen(s);
 }
-static int64_t GetChrootedPath(char *to, pid_t pid, const char *path) {
-  return GetChrootedPath0(to, pid, path, NULL);
+static int64_t GetChrootedPath(char *to, const char *path) {
+  return GetChrootedPath0(to, path, NULL);
 }
-char *DatabasePathForFile(char *to, pid_t pid, const char *path) {
+char *DatabasePathForFile(char *to, const char *path) {
   CMountPoint *mp = NULL;
   char dummy[1024];
-  GetChrootedPath0(dummy, pid, path, &mp);
+  GetChrootedPath0(dummy, path, &mp);
   if (!mp->document_perms)
-	return NULL;
+    return NULL;
   sprintf(to, "%s/%s", mp->db_path, dummy + strlen(mp->dst_path));
-  NormailizePath(to,to);
+  NormailizePath(to, to);
   return to;
 };
-static char *ChrootedRealpath(char *to, pid_t p, char *path) {
+static char *ChrootedRealpath(char *to, char *path) {
   char dst[1024];
-  GetChrootedPath(dst, p, path);
+  GetChrootedPath(dst, path);
   UnChrootPath(to, dst);
   return to;
 }
@@ -697,13 +747,14 @@ static uint32_t FilePerms(char *fn) {
   }
   return 0755; //??? TODO test if dir or file
 }
-static void ChrootDftOwnership(char *pa, pid_t p) {
+static void ChrootDftOwnership(char *pa) {
   char dst[1024];
-  CProcInfo *inf = GetProcInfByPid(p);
-  ChrootedRealpath(dst, p, pa);
+  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
+  ChrootedRealpath(dst, pa);
   HashTableSet(dst, inf->uid, inf->gid, FilePerms(dst));
 }
-static ptrdiff_t ReadPTraceString(char *to, pid_t pid, char *pt_ptr) {
+static ptrdiff_t ReadPTraceString(char *to, char *pt_ptr) {
+  pid_t pid = mc_current_pid;
   char *al_ptr = (char *)((uintptr_t)(pt_ptr + 255) & -256), *cur, *nul;
   size_t ret = 0;
   ptrdiff_t diff;
@@ -732,78 +783,76 @@ static ptrdiff_t ReadPTraceString(char *to, pid_t pid, char *pt_ptr) {
     ret += readb;
   }
 }
-static size_t WritePTraceString(void *backup, pid_t pid, void *pt_ptr,
-                                char const *st) {
+static size_t WritePTraceString(void *backup, void *pt_ptr, char const *st) {
+  pid_t pid = mc_current_pid;
   size_t len = strlen(st) + 1;
   if (backup)
-    assert(PTraceRead(pid, backup, pt_ptr, len) == len);
-  assert(PTraceWrite(pid, pt_ptr, st, len) == len);
+    assert(PTraceRead(mc_current_tid, backup, pt_ptr, len) == len);
+  assert(PTraceWrite(mc_current_tid, pt_ptr, st, len) == len);
   return len;
 }
-#define INTERCEPT_FILE1(pid, arg)                                              \
+#define INTERCEPT_FILE1(arg)                                                   \
   char backupstr[1024];                                                        \
   char have_str[1024], chroot[1023];                                           \
   int64_t backup_len;                                                          \
   void *orig_ptr;                                                              \
-  orig_ptr = (void *)ABIGetArg(pid, arg);                                      \
-  ReadPTraceString(have_str, pid, orig_ptr);                                   \
-  GetChrootedPath(chroot, pid, have_str);                                      \
-  backup_len = WritePTraceString(backupstr, pid, orig_ptr, chroot);            \
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);                                        \
-  waitpid(pid, NULL, 0);                                                       \
-  PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);
+  orig_ptr = (void *)GetArg(arg);                                              \
+  ReadPTraceString(have_str, orig_ptr);                                        \
+  GetChrootedPath(chroot, have_str);                                           \
+  backup_len = WritePTraceString(backupstr, orig_ptr, chroot);                 \
+  ToScx();                                                                     \
+  PTraceRestoreBytes(orig_ptr, backupstr, backup_len);
 
-#define INTERCEPT_FILE1_ONLY_ABS(pid, arg)                                     \
+#define INTERCEPT_FILE1_ONLY_ABS(arg)                                          \
   char backupstr[1024];                                                        \
   char have_str[1024], chroot[1023];                                           \
   int64_t backup_len;                                                          \
   void *orig_ptr;                                                              \
-  orig_ptr = (void *)ABIGetArg(pid, arg);                                      \
-  ReadPTraceString(have_str, pid, orig_ptr);                                   \
+  orig_ptr = (void *)GetArg(arg);                                              \
+  ReadPTraceString(have_str, orig_ptr);                                        \
   if (have_str[0] == '/') {                                                    \
-    GetChrootedPath(chroot, pid, have_str);                                    \
-    backup_len = WritePTraceString(backupstr, pid, orig_ptr, chroot);          \
-    ptrace(PT_TO_SCX, pid, (void *)1ul, 0);                                    \
-    waitpid(pid, NULL, 0);                                                     \
-    PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);                  \
+    GetChrootedPath(chroot, have_str);                                         \
+    backup_len = WritePTraceString(backupstr, orig_ptr, chroot);               \
+    ToScx();                                                                   \
+    PTraceRestoreBytes(orig_ptr, backupstr, backup_len);                       \
   } else {                                                                     \
-    ptrace(PT_TO_SCX, pid, (void *)1ul, 0);                                    \
-    waitpid(pid, NULL, 0);                                                     \
+    ToScx();                                                                   \
   }
 
-static void InterceptRealPathAt(pid_t pid) {
+static void InterceptRealPathAt() {
+  pid_t pid = mc_current_pid;
   char have_str[1024], chroot[1023];
   void *orig_ptr, *to_ptr;
-  orig_ptr = (void *)ABIGetArg(pid, 1);
-  to_ptr = (void *)ABIGetArg(pid, 2);
-  ReadPTraceString(have_str, pid, orig_ptr);
-  GetChrootedPath(chroot, pid, have_str);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ABISetReturn(pid, 0, 0);
+  orig_ptr = (void *)GetArg(1);
+  to_ptr = (void *)GetArg(2);
+  ReadPTraceString(have_str, orig_ptr);
+  GetChrootedPath(chroot, have_str);
+  ToScx();
+  SetReturn(0, 0);
 }
-static void InterceptChown(pid_t pid) {
+static void InterceptChown() {
+  pid_t pid = mc_current_pid;
   CProcInfo *inf = GetProcInfByPid(pid);
   char have[1024], c[1024], failed;
-  uid_t u = ABIGetArg(pid, 1);
-  gid_t g = ABIGetArg(pid, 2);
-  ReadPTraceString(have, pid, (char *)ABIGetArg(pid, 0));
-  GetChrootedPath(c, pid, have);
-  { INTERCEPT_FILE1(pid, 0); }
+  uid_t u = GetArg(1);
+  gid_t g = GetArg(2);
+  ReadPTraceString(have, (char *)GetArg(0));
+  GetChrootedPath(c, have);
+  { INTERCEPT_FILE1(0); }
   // TODO PERM CHECK
-  ABIGetReturn(pid, &failed);
+  GetReturn(&failed);
   if (!failed) {
     UnChrootPath(have, c);
     HashTableSet(have, u, g, FilePerms(have));
   }
-  ABISetReturn(pid, 0, 0);
+  SetReturn(0, 0);
 }
 #define PERM_WHAT_X 0b001
 #define PERM_WHAT_W 0b010
 #define PERM_WHAT_R 0b100
 
 // Returns 0 if yat,else -errno
-static int HasPerms(int af, pid_t p, char *path_) {
+static int HasPerms(int af, char *path_) {
   char path[1024];
   NormailizePath(path, path_);
   int what = 0;
@@ -820,12 +869,13 @@ static int HasPerms(int af, pid_t p, char *path_) {
   struct filestat_list *head;
   // See /usr/src/use.bin/procstat in FreeBSD
   struct filestat *fs;
-  CProcInfo *inf = GetProcInfByPid(p);
+  pid_t p = mc_current_pid;
+  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
   int ngrps = inf->ngrps;
   gid_t *groups = inf->groups;
   int cnt = 0;
   CHashEntry *e, dummy;
-  GetChrootedPath(dst, p, path);
+  GetChrootedPath(dst, path);
   UnChrootPath(uc, dst);
   struct stat st;
   // Nroot here,access follows symbolic links,use stat and check for poo poo
@@ -848,11 +898,11 @@ static int HasPerms(int af, pid_t p, char *path_) {
         }
       }
       if (dir[0] != 0)
-        return HasPerms(F_OK | af, p, dir);
+        return HasPerms(F_OK | af, dir);
     }
   }
   if (e = HashTableGet(&dummy, uc)) {
-	  //printf("%s,%o",uc,e->perms);
+    // printf("%s,%o",uc,e->perms);
     // Try use
     if (e->uid == inf->uid) {
       masked = (e->perms >> 6) & 0b111;
@@ -876,40 +926,40 @@ static int HasPerms(int af, pid_t p, char *path_) {
   return 0; //???
 }
 
-static void InterceptAccess(pid_t pid) {
+static void InterceptAccess() {
   int passed;
   char r, failed;
   char what[1024], have[1024];
-  int want = ABIGetArg(pid, 1);
-  ReadPTraceString(have, pid, (char *)ABIGetArg(pid, 0));
-  GetChrootedPath(what, pid, have);
-  { INTERCEPT_FILE1(pid, 0); }
-  passed = ABIGetReturn(pid, &failed);
+  int want = GetArg(1);
+  ReadPTraceString(have, (char *)GetArg(0));
+  GetChrootedPath(what, have);
+  { INTERCEPT_FILE1(0); }
+  passed = GetReturn(&failed);
   // User running MrChrootBSD must have access to the file,then we apply
   // emulated perms
-  UnChrootPath(what,what);
-  if (!failed && 0 == HasPerms(R_OK,pid, what)) {
-    ABISetReturn(pid, 0, 0);
+  UnChrootPath(what, what);
+  if (!failed && 0 == HasPerms(R_OK, what)) {
+    SetReturn(0, 0);
   } else if (failed) {
-    ABISetReturn(pid, passed, 1);
+    SetReturn(passed, 1);
   } else {
     // Invalid permsision
-    ABISetReturn(pid, -HasPerms(R_OK, pid, have), 0);
+    SetReturn(HasPerms(R_OK, have), 0);
   }
 }
 
-static void InterceptOpen(pid_t pid) {
-  CProcInfo *inf = GetProcInfByPid(pid);
-  int64_t fd, flags = ABIGetArg(pid, 1);
+static void InterceptOpen() {
+  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
+  int64_t fd, flags = GetArg(1);
   char failed;
-  char *orig_ptr = (char *)ABIGetArg(pid, 0);
+  char *orig_ptr = (char *)GetArg(0);
   char have_str[1024], chroot[1024];
-  ReadPTraceString(have_str, pid, orig_ptr);
-  { INTERCEPT_FILE1(pid, 0); }
-  fd = ABIGetReturn(pid, &failed);
+  ReadPTraceString(have_str, orig_ptr);
+  { INTERCEPT_FILE1(0); }
+  fd = GetReturn(&failed);
   if (!failed) {
     if (flags & O_CREAT)
-      ChrootDftOwnership(have_str, pid);
+      ChrootDftOwnership(have_str);
   }
 }
 static bool CheckShebang(char *chrooted_name, char *prog_name_to) {
@@ -940,32 +990,32 @@ static char *SkipWhitespace(char *p) {
   return p;
 }
 
-static void *PTraceReadPtr(pid_t pid, void *at) {
+static void *PTraceReadPtr(void *at) {
   void *ret;
-  assert(PTraceRead(pid, &ret, at, 8) == 8);
+  assert(PTraceRead(mc_current_tid, &ret, at, 8) == 8);
   return ret;
 }
 
-static void PTraceWritePtr(pid_t pid, void *at, void *ptr) {
-  assert(PTraceWrite(pid, at, &ptr, 8) == 8);
+static void PTraceWritePtr(void *at, void *ptr) {
+  assert(PTraceWrite(mc_current_tid, at, &ptr, 8) == 8);
 }
-static void *GetHackDataAreaForPid(pid_t pid) {
-  CProcInfo *pinf = GetProcInfByPid(pid);
-  return PTraceReadPtr(pid, &pinf->hacks_array_ptr->data_zone);
+static void *GetHackDataAreaForPid() {
+  CProcInfo *pinf = GetProcInfByPid(mc_current_pid);
+  return PTraceReadPtr(&pinf->hacks_array_ptr->data_zone);
 }
 
 // Returns end of written data
-static char *RewriteEnv(pid_t pid, char **prog_env, char *data_ptr) {
+static char *RewriteEnv(char **prog_env, char *data_ptr) {
   int64_t idx, idx2, argc = 0;
   char *arg;
   char val[4048];
   char chrooted[4048], orig[4048], final[4048];
-  for (idx = 0; arg = PTraceReadPtr(pid, prog_env + idx); idx++)
+  for (idx = 0; arg = PTraceReadPtr(prog_env + idx); idx++)
     argc++;
   char *new_env_ptrs[argc];
-  for (idx = 0; arg = PTraceReadPtr(pid, prog_env + idx); idx++) {
+  for (idx = 0; arg = PTraceReadPtr(prog_env + idx); idx++) {
 #define LD_LIBRARY_PATH_EQ "LD_LIBRARY_PATH="
-    ReadPTraceString(val, pid, arg);
+    ReadPTraceString(val, arg);
     if (!strncmp(LD_LIBRARY_PATH_EQ, val, strlen(LD_LIBRARY_PATH_EQ))) {
       strcpy(final, LD_LIBRARY_PATH_EQ);
       char *start = val + strlen(LD_LIBRARY_PATH_EQ), *end;
@@ -979,16 +1029,16 @@ static char *RewriteEnv(pid_t pid, char **prog_env, char *data_ptr) {
         orig[idx2++] = *start++;
       }
       orig[idx2] = 0;
-      GetChrootedPath(chrooted, pid, orig);
+      GetChrootedPath(chrooted, orig);
       strcpy(final + strlen(final), chrooted);
       if (*end == ':') {
         strcpy(final + strlen(final), ":");
         start = end + 1;
         goto again;
       }
-      WritePTraceString(NULL, pid, data_ptr, final);
+      WritePTraceString(NULL, data_ptr, final);
       new_env_ptrs[idx] = data_ptr;
-      PTraceWritePtr(pid, new_env_ptrs[idx], prog_env + idx);
+      PTraceWritePtr(new_env_ptrs[idx], prog_env + idx);
       data_ptr += strlen(final) + 1;
     } else {
       new_env_ptrs[idx] = arg;
@@ -998,45 +1048,45 @@ static char *RewriteEnv(pid_t pid, char **prog_env, char *data_ptr) {
 }
 static uid_t FileUid(const char *path);
 static gid_t FileGid(const char *path);
-static void InterceptExecve(pid_t pid) {
+static void InterceptExecve() {
   char have_str[1024], chroot[1024], backup[1024], poop_ant[1024];
   char *orig_ptr, **argv, **env;
   char *ptr, *ptr2, *command, *argument;
   int64_t fd, args[3], bulen, extra_args = 0, perms;
-  struct ptrace_sc_remote rmt;
-  CProcInfo *pinf = GetProcInfByPid(pid);
-  orig_ptr = (void *)ABIGetArg(pid, 0);
-  argv = (void *)ABIGetArg(pid, 1);
-  env = (void *)ABIGetArg(pid, 2);
-  ReadPTraceString(have_str, pid, orig_ptr);
-  GetChrootedPath(chroot, pid, have_str);
+  struct ptrace_sc_remote rmt = {0};
+  CProcInfo *pinf = GetProcInfByPid(mc_current_pid);
+  orig_ptr = (void *)GetArg(0);
+  argv = (void *)GetArg(1);
+  env = (void *)GetArg(2);
+  ReadPTraceString(have_str, orig_ptr);
+  GetChrootedPath(chroot, have_str);
   perms = FilePerms(have_str);
   memset(poop_ant, 0, sizeof(poop_ant));
   if (!CheckShebang(chroot, poop_ant)) {
     char *tmp1, *tmp2;
     // exeve(open(chrooted),argv,env)
-    ABISetSyscall(pid, 5); // iopen
-    ABISetArg(pid, 1, O_EXEC);
-    ReadPTraceString(poop_ant, pid, orig_ptr);
-    GetChrootedPath(chroot, pid, poop_ant);
-    bulen = WritePTraceString(backup, pid, orig_ptr, chroot);
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);
-    waitpid(pid, NULL, 0);
-    PTraceRestoreBytes(pid, orig_ptr, backup, bulen);
-    args[0] = ABIGetReturn(pid, NULL);
+    SetSyscall(5); // iopen
+    SetArg(1, O_EXEC);
+    ReadPTraceString(poop_ant, orig_ptr);
+    GetChrootedPath(chroot, poop_ant);
+    bulen = WritePTraceString(backup, orig_ptr, chroot);
+    ToScx();
+    PTraceRestoreBytes(orig_ptr, backup, bulen);
+    args[0] = GetReturn(NULL);
     args[1] = (int64_t)argv;
     args[2] = (int64_t)env;
     int64_t i;
     char *av;
-    for (i = 0; av = PTraceReadPtr(pid, argv + i); i++) {
+    for (i = 0; av = PTraceReadPtr(argv + i); i++) {
       char ass[1023];
-      PTraceRead(pid, ass, av, 1024);
+      PTraceRead(mc_current_tid, ass, av, 1024);
     }
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    RewriteEnv(pid, env, GetHackDataAreaForPid(pid));
-    ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
+    RewriteEnv(env, GetHackDataAreaForPid());
+    ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
+    waitpid(mc_current_tid, NULL, 0);
   } else {
     char *extra_arg_ptrs[256];
     // fexecve(open("interrepret name"),argv,env)
@@ -1045,20 +1095,18 @@ static void InterceptExecve(pid_t pid) {
     while (*ptr2 && !isblank(*ptr2))
       ptr2++;
     *ptr2++ = 0;
-    GetChrootedPath(chroot, pid, command);
-    ABISetSyscall(pid, 5);
-    ABISetArg(pid, 1, O_EXEC);
-    bulen = WritePTraceString(backup, pid, orig_ptr, chroot);
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);
-    waitpid(pid, NULL, 0);
-
-    PTraceRestoreBytes(pid, orig_ptr, backup, bulen);
+    GetChrootedPath(chroot, command);
+    SetSyscall(5);
+    SetArg(1, O_EXEC);
+    bulen = WritePTraceString(backup, orig_ptr, chroot);
+    ToScx();
+    PTraceRestoreBytes(orig_ptr, backup, bulen);
     // Insert the pointer to the command name before argv(I will dump the
     // name to NULL,it doesnt matter as we will change the program image at
     // fexecve)
-    ptr = GetHackDataAreaForPid(pid);
+    ptr = GetHackDataAreaForPid();
     extra_args = 0;
-    WritePTraceString(NULL, pid, ptr, command);
+    WritePTraceString(NULL, ptr, command);
     extra_arg_ptrs[extra_args++] = ptr;
     ptr += strlen(command) + 1;
     while (*ptr2) {
@@ -1068,7 +1116,7 @@ static void InterceptExecve(pid_t pid) {
         ptr2++;
       *ptr2++ = 0;
       extra_arg_ptrs[extra_args++] = ptr;
-      WritePTraceString(NULL, pid, ptr, argument);
+      WritePTraceString(NULL, ptr, argument);
       ptr += strlen(argument) + 1;
     }
 
@@ -1079,32 +1127,33 @@ static void InterceptExecve(pid_t pid) {
     // argv[...] = ...
 
     // Put command name here
-    WritePTraceString(NULL, pid, ptr, have_str);
+    WritePTraceString(NULL, ptr, have_str);
     extra_arg_ptrs[extra_args++] = ptr;
     ptr += strlen(have_str) + 1;
 
     argv -= extra_args;
 
     for (fd = 0; fd != extra_args; fd++) {
-      PTraceWritePtr(pid, argv + fd, extra_arg_ptrs[fd]);
-      ReadPTraceString(have_str, pid, extra_arg_ptrs[fd]);
+      PTraceWritePtr(argv + fd, extra_arg_ptrs[fd]);
+      ReadPTraceString(have_str, extra_arg_ptrs[fd]);
     }
 
     // The first argument to the argv is the program name,but we delegated
     // it to the interrepter REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY
-    while (PTraceReadPtr(pid, argv + fd)) {
-      PTraceWritePtr(pid, argv + fd, PTraceReadPtr(pid, argv + fd + 1));
+    while (PTraceReadPtr(argv + fd)) {
+      PTraceWritePtr(argv + fd, PTraceReadPtr(argv + fd + 1));
       fd++;
     }
 
-    args[0] = ABIGetReturn(pid, NULL);
+    args[0] = GetReturn(NULL);
     args[1] = (int64_t)argv;
     args[2] = (int64_t)env;
     rmt.pscr_syscall = 492;
     rmt.pscr_nargs = 3;
     rmt.pscr_args = args;
-    RewriteEnv(pid, env, ptr);
-    ptrace(PT_SC_REMOTE, pid, (caddr_t)&rmt, sizeof rmt);
+    RewriteEnv(env, ptr);
+    ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
+    waitpid(mc_current_tid, NULL, 0);
   }
   if (perms & S_ISUID) {
     pinf->euid = FileUid(have_str);
@@ -1114,131 +1163,123 @@ static void InterceptExecve(pid_t pid) {
   }
 }
 
-static void InterceptReadlink(pid_t pid) {
+static void InterceptReadlink() {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, r, buf_len = ABIGetArg(pid, 2);
-  void *orig_ptr = (void *)ABIGetArg(pid, 0),
-       *buf_ptr = (void *)ABIGetArg(pid, 1);
-  ReadPTraceString(got_path, pid, orig_ptr);
-  GetChrootedPath(new_path, pid, got_path);
-  backup_len = WritePTraceString(backup, pid, orig_ptr, new_path);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  PTraceRestoreBytes(pid, orig_ptr, backup, backup_len);
+  int64_t backup_len, r, buf_len = GetArg(2);
+  void *orig_ptr = (void *)GetArg(0), *buf_ptr = (void *)GetArg(1);
+  ReadPTraceString(got_path, orig_ptr);
+  GetChrootedPath(new_path, got_path);
+  backup_len = WritePTraceString(backup, orig_ptr, new_path);
+  ToScx();
+  PTraceRestoreBytes(orig_ptr, backup, backup_len);
 }
 
-static void InterceptReadlinkAt(pid_t pid) {
+static void InterceptReadlinkAt() {
   char new_path[1024], got_path[1024], backup[1024];
   char rlbuf[1024];
-  int64_t backup_len, buf_len = ABIGetArg(pid, 3), r;
-  void *orig_ptr = (void *)ABIGetArg(pid, 1),
-       *buf_ptr = (void *)ABIGetArg(pid, 2);
-  ReadPTraceString(got_path, pid, orig_ptr);
+  int64_t backup_len, buf_len = GetArg(3), r;
+  void *orig_ptr = (void *)GetArg(1), *buf_ptr = (void *)GetArg(2);
+  ReadPTraceString(got_path, orig_ptr);
   if (*got_path == '/') {
-    GetChrootedPath(new_path, pid, got_path);
-    backup_len = WritePTraceString(backup, pid, orig_ptr, new_path);
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);
-    waitpid(pid, NULL, 0);
-    PTraceRestoreBytes(pid, orig_ptr, backup, backup_len);
+    GetChrootedPath(new_path, got_path);
+    backup_len = WritePTraceString(backup, orig_ptr, new_path);
+    ToScx();
+    PTraceRestoreBytes(orig_ptr, backup, backup_len);
   } else {
-    ptrace(PT_TO_SCX, pid, (void *)1, 0);
-    waitpid(pid, NULL, 0);
-    ReadPTraceString(new_path, pid, buf_ptr);
+    ToScx();
+    ReadPTraceString(new_path, buf_ptr);
   }
 }
 
-#define INTERCEPT_FILE2(pid, arg1, arg2)                                       \
+#define INTERCEPT_FILE2(arg1, arg2)                                            \
   char backup1[1024], chroot1[1024], got1[1024];                               \
   char backup2[1024], chroot2[1024], got2[1024];                               \
-  void *orig_ptr1 = (void *)ABIGetArg(pid, arg1);                              \
-  void *orig_ptr2 = (void *)ABIGetArg(pid, arg2);                              \
+  void *orig_ptr1 = (void *)GetArg(arg1);                                      \
+  void *orig_ptr2 = (void *)GetArg(arg2);                                      \
   char *dumb_ptr =                                                             \
       orig_ptr1; /*write 2 strings to  1 pointer in case orig_ptr1/orig_ptr2   \
                     overlap(chrooted strings are larger than originals)*/      \
   int64_t backup_len1, backup_len2;                                            \
-  ReadPTraceString(got1, pid, orig_ptr1);                                      \
-  ReadPTraceString(got2, pid, orig_ptr2);                                      \
-  GetChrootedPath(chroot1, pid, got1);                                         \
-  GetChrootedPath(chroot2, pid, got2);                                         \
+  ReadPTraceString(got1, orig_ptr1);                                           \
+  ReadPTraceString(got2, orig_ptr2);                                           \
+  GetChrootedPath(chroot1, got1);                                              \
+  GetChrootedPath(chroot2, got2);                                              \
   /*                                                                           \
   //[chroot1\0chroot2\0]                                                       \
   //          ^                                                                \
   //          |                                                                \
   //          + Arg1 is here*/                                                 \
   dumb_ptr = orig_ptr1;                                                        \
-  backup_len1 = WritePTraceString(backup1, pid, orig_ptr1, chroot1);           \
+  backup_len1 = WritePTraceString(backup1, orig_ptr1, chroot1);                \
   dumb_ptr += backup_len1;                                                     \
-  backup_len2 = WritePTraceString(backup2, pid, dumb_ptr, chroot2);            \
-  ABISetArg(pid, 1, (int64_t)dumb_ptr); /*Re-assign poo poo address*/          \
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);                                        \
-  waitpid(pid, NULL, 0);                                                       \
-  PTraceRestoreBytes(pid, orig_ptr1, backup1, backup_len1);                    \
-  PTraceRestoreBytes(pid, dumb_ptr, backup2, backup_len2);
+  backup_len2 = WritePTraceString(backup2, dumb_ptr, chroot2);                 \
+  SetArg(1, (int64_t)dumb_ptr); /*Re-assign poo poo address*/                  \
+  ToScx();                                                                     \
+  PTraceRestoreBytes(orig_ptr1, backup1, backup_len1);                         \
+  PTraceRestoreBytes(dumb_ptr, backup2, backup_len2);
 
-static void InterceptLink(pid_t pid) {
+static void InterceptLink() {
   char name[1024];
   char failed;
-  CProcInfo *inf = GetProcInfByPid(pid);
+  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
   int64_t r;
-  ReadPTraceString(name, pid, (char *)ABIGetArg(pid, 0));
-  { INTERCEPT_FILE2(pid, 0, 1); }
-  r = ABIGetReturn(pid, &failed);
+  ReadPTraceString(name, (char *)GetArg(0));
+  { INTERCEPT_FILE2(0, 1); }
+  r = GetReturn(&failed);
   if (!failed) {
-    ChrootDftOwnership(name, pid);
+    ChrootDftOwnership(name);
   }
 }
 
-static void InterceptUnlink(pid_t pid) {
-  INTERCEPT_FILE1(pid, 0); // TODO remove hash table }
+static void InterceptUnlink() {
+  INTERCEPT_FILE1(0); // TODO remove hash table }
 }
-static void InterceptShmRename(pid_t pid) { INTERCEPT_FILE2(pid, 0, 1); }
+static void InterceptShmRename() { INTERCEPT_FILE2(0, 1); }
 
-static void InterceptChdir(pid_t pid) {
+static void InterceptChdir() {
   char backupstr[1024];
   char have_str[1024], chroot[1023];
   int64_t backup_len;
   void *orig_ptr;
-  orig_ptr = (void *)ABIGetArg(pid, 0);
-  ReadPTraceString(have_str, pid, orig_ptr);
-  GetChrootedPath(chroot, pid, have_str);
-  backup_len = WritePTraceString(backupstr, pid, orig_ptr, chroot);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  PTraceRestoreBytes(pid, orig_ptr, backupstr, backup_len);
+  orig_ptr = (void *)GetArg(0);
+  ReadPTraceString(have_str, orig_ptr);
+  GetChrootedPath(chroot, have_str);
+  backup_len = WritePTraceString(backupstr, orig_ptr, chroot);
+  ToScx();
+  PTraceRestoreBytes(orig_ptr, backupstr, backup_len);
 }
 
-static void Intercept__Getcwd(pid_t pid) {
+static void Intercept__Getcwd() {
   int64_t olen, cap;
   void *orig_ptr;
   char cwd[1024];
-  olen = GetProcCwd(cwd, pid);
-  orig_ptr = (void *)ABIGetArg(pid, 0);
-  cap = ABIGetArg(pid, 1);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  PTraceWriteBytes(pid, orig_ptr, cwd, cap > olen + 1 ? olen + 1 : cap);
-  ABISetReturn(pid, 0, 0);
+  olen = GetProcCwd(cwd);
+  orig_ptr = (void *)GetArg(0);
+  cap = GetArg(1);
+  ToScx();
+  PTraceWriteBytes(orig_ptr, cwd, cap > olen + 1 ? olen + 1 : cap);
+  SetReturn(0, 0);
 }
 
-static void InterceptChmod(pid_t pid) {
-  CProcInfo *inf = GetProcInfByPid(pid);
+static void InterceptChmod() {
   char have[1024], real[1024], failed;
-  uint32_t perms = ABIGetArg(pid, 1);
-  ReadPTraceString(have, pid, (char *)ABIGetArg(pid, 0));
-  { INTERCEPT_FILE1(pid, 0); }
-  ChrootedRealpath(real, pid, have);
-  ABIGetReturn(pid, &failed);
+  uint32_t perms = GetArg(1);
+  ReadPTraceString(have, (char *)GetArg(0));
+  { INTERCEPT_FILE1(0); }
+  ChrootedRealpath(real, have);
+  GetReturn(&failed);
   // TODO PERM CHECK
   if (!failed) {
     HashTableSet(real, FileUid(real), FileGid(real), perms);
   }
-  ABISetReturn(pid, 0, 0);
+  SetReturn(0, 0);
 }
 
-static void InterceptSetuid(pid_t pid) {
+static void InterceptSetuid() {
+  pid_t pid = mc_current_pid;
   CProcInfo *inf = GetProcInfByPid(pid);
-  uid_t want = ABIGetArg(pid, 0);
+  uid_t want = GetArg(0);
   // Sets only if inf->ruid==root||(inf->suid==want||inf->euid==want)
   if (inf->uid == 0) {
   pass:
@@ -1246,54 +1287,44 @@ static void InterceptSetuid(pid_t pid) {
   } else if (inf->suid == want || inf->euid == want) {
     goto pass;
   }
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ABISetReturn(pid, 0, 0);
+  ToScx();
+  SetReturn(0, 0);
 }
-static void InterceptSeteuid(pid_t pid) {
+static void InterceptSeteuid() {
+  pid_t pid = mc_current_pid;
   CProcInfo *inf = GetProcInfByPid(pid);
-  uid_t want = ABIGetArg(pid, 0);
+  uid_t want = GetArg(0);
   if (inf->uid == 0) {
   pass:
     inf->euid = want;
   } else if (inf->suid == want || inf->euid == want) {
     goto pass;
   }
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ABISetReturn(pid, 0, 0);
+  ToScx();
+  SetReturn(0, 0);
 }
-static void InterceptGetuid(pid_t pid) {
+static void InterceptGetuid() {
+  pid_t pid = mc_current_pid;
   CProcInfo *inf = GetProcInfByPid(pid);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ABISetReturn(pid, inf->uid, 0);
+  ToScx();
+  SetReturn(inf->uid, 0);
 }
 
-static void InterceptGeteuid(pid_t pid) {
+static void InterceptGeteuid() {
+  pid_t pid = mc_current_pid;
   CProcInfo *inf = GetProcInfByPid(pid);
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
-  ABISetReturn(pid, inf->euid, 0);
+  ToScx();
+  SetReturn(inf->euid, 0);
 }
-static void InterceptMount(pid_t pid) {
-  (void)pid;
-  // TODO
-}
+static void InterceptMount() {}
 
-static void InterceptUnmount(pid_t pid) {
-  (void)pid;
-  // TODO
-}
+static void InterceptUnmount() {}
 
-static void InterceptNmount(pid_t pid) {
-  (void)pid;
-  // TODO
-}
+static void InterceptNmount() {}
 
-static void InterceptAccessShmUnlink(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptAccessShmUnlink() { INTERCEPT_FILE1(0); }
 
-static void InterceptAccessTruncate(pid_t pid) { INTERCEPT_FILE1(pid, 0); }
+static void InterceptAccessTruncate() { INTERCEPT_FILE1(0); }
 
 static gid_t FileGid(const char *path) {
   CHashEntry *ent, dummy;
@@ -1313,49 +1344,49 @@ static uid_t FileUid(const char *path) {
   }
   return 0;
 }
-static char *AtSytle(char *, pid_t, int64_t, int64_t);
-static void InterceptFstat(pid_t pid) {
+static char *AtSytle(char *, int64_t, int64_t);
+static void InterceptFstat() {
   uid_t dummyu = 0;
   gid_t dummyg = 0;
-  uint32_t perms=0755;
+  uint32_t perms = 0755;
   struct stat st;
-  uint8_t *ptr = (void *)ABIGetArg(pid, 1);
+  uint8_t *ptr = (void *)GetArg(1);
   char who[1024];
-  FdToStr(who, pid, ABIGetArg(pid, 0));
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, NULL, 0);
+  FdToStr(who, GetArg(0));
+  ToScx();
   if (who) {
     dummyu = FileUid(who);
     dummyg = FileGid(who);
-    perms=FilePerms(who);
+    perms = FilePerms(who);
   }
 #define W(p, T, m, V)                                                          \
-  PTraceWrite(pid, p + offsetof(T, m), &(size_t){V}, sizeof declval(T).m)
+  PTraceWrite(mc_current_tid, p + offsetof(T, m), &(size_t){V},                \
+              sizeof declval(T).m)
   W(ptr, struct stat, st_uid, dummyu);
   W(ptr, struct stat, st_gid, dummyg);
-  //W(ptr, struct stat, st_mode, perms);
+  // W(ptr, struct stat, st_mode, perms);
 }
-static void InterceptFstatat(pid_t pid) {
-  void *ptr = (void *)ABIGetArg(pid, 2);
+static void InterceptFstatat() {
+  void *ptr = (void *)GetArg(2);
   char who[1024];
-  AtSytle(who, pid, 0, 1);
+  AtSytle(who, 0, 1);
   UnChrootPath(who, who);
   W(ptr, struct stat, st_uid, FileUid(who));
   W(ptr, struct stat, st_gid, FileGid(who));
-  //W(ptr, struct stat, st_mode, FilePerms(who));
+  // W(ptr, struct stat, st_mode, FilePerms(who));
 }
 
 #undef W
 
-static void FakeGroup(pid_t pid) {
+static void FakeGroup() {
   uid_t who = 0;
+  pid_t pid = mc_current_pid;
   CProcInfo *pinf = GetProcInfByPid(pid);
   if (pinf) {
     who = pinf->gid;
   }
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, 0, 0);
-  ABISetReturn(pid, who, 0);
+  ToScx();
+  SetReturn(who, 0);
 }
 
 static CMountPoint *AddMountPoint(const char *dst, const char *src) {
@@ -1374,71 +1405,69 @@ static CMountPoint *AddMountPoint(const char *dst, const char *src) {
   mp->last->next = mp;
   return mp;
 }
-static void FakeUser(pid_t pid) {
+static void FakeUser() {
   uid_t who = 0;
+  pid_t pid = mc_current_pid;
   CProcInfo *pinf = GetProcInfByPid(pid);
   if (pinf) {
     who = pinf->gid;
   }
-  ptrace(PT_TO_SCX, pid, (void *)1, 0);
-  waitpid(pid, 0, 0);
-  ABISetReturn(pid, who, 0);
+  ToScx();
+  SetReturn(who, 0);
 }
-static char *AtSytle(char *_to, pid_t pid, int64_t fd, int64_t path) {
+static char *AtSytle(char *_to, int64_t fd, int64_t path) {
   char dst[1024], chroot[1024], rel[1024], old[1024];
   char to[1024];
   char *ptr;
   int have_fd;
-  int is_rel=0;
-  ReadPTraceString(dst, pid, ptr = (char *)ABIGetArg(pid, path));
+  int is_rel = 0;
+  ReadPTraceString(dst, ptr = (char *)GetArg(path));
   if (dst[0] == '/') { // Abolsute
-    GetChrootedPath(to, pid, dst);
+    GetChrootedPath(to, dst);
   } else {
     strcpy(to, dst);
-    is_rel=1;
-    have_fd=ABIGetArg(pid,fd);
+    is_rel = 1;
+    have_fd = GetArg(fd);
   }
-  int64_t restore = WritePTraceString(old, pid, ptr, to);
-  ptrace(PT_TO_SCX, pid, (caddr_t)1, 0);
-  waitpid(pid, NULL, 0);
-  PTraceRestoreBytes(pid, ptr, old, restore);
-  if (_to&&is_rel) {
-	FdToStr(rel,pid,have_fd);
-    sprintf(chroot,"%s/%s",rel,to);
-    GetChrootedPath(_to,pid,chroot);
-  } else if(_to&&!is_rel) {
-	 NormailizePath(_to,to);
+  int64_t restore = WritePTraceString(old, ptr, to);
+  ToScx();
+  PTraceRestoreBytes(ptr, old, restore);
+  if (_to && is_rel) {
+    FdToStr(rel, have_fd);
+    sprintf(chroot, "%s/%s", rel, to);
+    GetChrootedPath(_to, chroot);
+  } else if (_to && !is_rel) {
+    NormailizePath(_to, to);
   }
   return _to;
 }
 
-static void InterceptLinkat(pid_t pid) {
+static void InterceptLinkat() {
   char a[1024], b[1024];
   char old[2048];
   char total[2048];
-  char *write_to = (char *)ABIGetArg(pid, 1);
+  char *write_to = (char *)GetArg(1);
   int64_t i;
   for (i = 0; i != 2; i++) {
     char dst[1024], rel[1024];
     char *to = i ? b : a;
     char *ptr;
-    ReadPTraceString(dst, pid, ptr = (char *)ABIGetArg(pid, 1 + 2 * i));
+    ReadPTraceString(dst, ptr = (char *)GetArg(1 + 2 * i));
     if (dst[0] == '/') { // Abolsute
-      GetChrootedPath(to, pid, dst);
+      GetChrootedPath(to, dst);
     } else
       strcpy(to, dst);
   }
   int64_t total_len = 2 + strlen(a) + strlen(b);
   sprintf(total, "%s%c%s", a, 0, b);
-  PTraceRead(pid, old, write_to, total_len);
-  PTraceWriteBytes(pid, write_to, total, total_len);
-  ABISetArg(pid, 3, (int64_t)(write_to + 1 + strlen(a)));
-  ptrace(PT_TO_SCX, pid, (caddr_t)1, 0);
-  waitpid(pid, NULL, 0);
-  PTraceRestoreBytes(pid, write_to, old, total_len);
+  PTraceRead(mc_current_tid, old, write_to, total_len);
+  PTraceWriteBytes(write_to, total, total_len);
+  SetArg(3, (int64_t)(write_to + 1 + strlen(a)));
+  ToScx();
+  PTraceRestoreBytes(write_to, old, total_len);
 }
 int main(int argc, const char *argv[], const char **env) {
-  signal(SIGHUP, SIG_IGN); //Whoops
+  signal(SIGHUP, SIG_IGN);
   pid_t pid, pid2;
   int64_t idx;
   int ch;
@@ -1517,7 +1546,14 @@ int main(int argc, const char *argv[], const char **env) {
       struct ptrace_lwpinfo inf;
       CProcInfo *pinf = GetProcInfByPid(pid2);
       ptrace(PT_LWPINFO, pid2, (caddr_t)&inf, sizeof inf);
-      ptrace(PT_FOLLOW_FORK, pid2, NULL, 1);
+
+      /* 21 Nroot here,I have mc_current_pid/mc_current_tid
+       *   ALWAYS USE mc_current_tid(LWP) instead of the pid because
+       *   FreeBSD will choose a random thread of a pid
+       */
+      mc_current_pid = pid2;
+      mc_current_tid = inf.pl_lwpid;
+
       if (WIFEXITED(cond)) {
         DelegatePtraceEvent(pinf->parent, pid2, cond);
         pid_t par = pinf->parent;
@@ -1563,11 +1599,20 @@ int main(int argc, const char *argv[], const char **env) {
         ptrace(PT_TO_SCE, pid2, (void *)1, 0);
         continue;
       }
+      if (inf.pl_flags & PL_FLAG_EXITED) {
+        pinf->flags |= PIF_EXITED;
+        continue;
+      }
       if (inf.pl_flags & (PL_FLAG_BORN | PL_FLAG_EXEC)) {
-        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        pinf->flags &= ~PIF_EXITED;
+        ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
+        ptrace(PT_LWP_EVENTS, mc_current_tid, NULL, 1);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         continue;
       } else if (inf.pl_flags &
                  (PL_FLAG_FORKED | PL_FLAG_VFORKED | PL_FLAG_VFORK_DONE)) {
+        ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
+        ptrace(PT_LWP_EVENTS, mc_current_tid, NULL, 1);
         // Inheret our hacks from LD_PRELOAD hack
         CProcInfo *parent = pinf;
         CProcInfo *child = GetProcInfByPid(inf.pl_child_pid);
@@ -1585,31 +1630,30 @@ int main(int argc, const char *argv[], const char **env) {
         memcpy(child->groups, parent->groups, child->ngrps * sizeof(gid_t));
         // Born again?
         parent->flags &= ~PIF_EXITED;
-        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         continue;
       } else if (inf.pl_flags & PL_FLAG_CHILD) {
-        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
+        ptrace(PT_LWP_EVENTS, mc_current_tid, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         continue;
       } else if (inf.pl_flags & PL_FLAG_SCE) {
-        // printf("%d\n",inf.pl_syscall_code);
+		  //fprintf(stderr,"%d,%d\n",pid2,inf.pl_syscall_code);
         switch (inf.pl_syscall_code) {
-			
+
         case MR_CHROOT_NOSYS: {
           char chrooted[1024];
           // In preload_hack.c,I use an indrtiect syscall,so use argument 1
           // instead of 0
-          pinf->hacks_array_ptr = (CMrChrootHackPtrs *)ABIGetArg(pid2, 1);
+          pinf->hacks_array_ptr = (CMrChrootHackPtrs *)GetArg(1);
 
-          char *write_chroot_to = (char *)ABIGetArg(pid2, 2);
-          ReadPTraceString(chrooted, pid2, write_chroot_to);
-          GetChrootedPath(chrooted, pid2, "/");
-          PTraceWriteBytes(pid2, write_chroot_to, chrooted,
-                           strlen(chrooted) + 1);
-          ABISetSyscall(pid2,
-                        36); // Sync Takes no arguments,repalce with valid
-                             // syscall(to avoid a signal for invalid syscall)
-          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-          waitpid(pid2, NULL, 0);
+          char *write_chroot_to = (char *)GetArg(2);
+          ReadPTraceString(chrooted, write_chroot_to);
+          GetChrootedPath(chrooted, "/");
+          PTraceWriteBytes(write_chroot_to, chrooted, strlen(chrooted) + 1);
+          SetSyscall(36); // Sync Takes no arguments,repalce with valid
+          // syscall(to avoid a signal for invalid syscall)
+          ToScx();
         } break;
         case 0: // syscall
           break;
@@ -1623,7 +1667,7 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         case 5: { // open
           int af = 0;
-          int64_t want_ = ABIGetArg(pid2, 1);
+          int64_t want_ = GetArg(1);
           if (want_ & O_RDONLY)
             af |= R_OK;
           if (want_ & O_RDWR)
@@ -1633,68 +1677,70 @@ int main(int argc, const char *argv[], const char **env) {
 #define PERMCHECK(af, PATH)                                                    \
   {                                                                            \
     char dst[1024];                                                            \
-    ReadPTraceString(dst, pid2, (char *)ABIGetArg(pid2, PATH));                \
-    if (0 != HasPerms((af), pid2, dst)) {                                      \
-      ABISetSyscall(pid2, 20); /*  Doesnt do anything*/                        \
-      ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);                                  \
-      waitpid(pid2, NULL, 0);                                                  \
-      ABISetReturn(pid2, -HasPerms((af), pid2, dst), 1);                       \
+    ReadPTraceString(dst, (char *)GetArg(PATH));                               \
+    if (0 != HasPerms((af), dst)) {                                            \
+      SetSyscall(20); /*  Doesnt do anything*/                                 \
+      ToScx();                                                                 \
+      SetReturn(-HasPerms((af), dst), 1);                                       \
       break;                                                                   \
     }                                                                          \
   }
-          InterceptOpen(pid2);
+          InterceptOpen();
         } break;
         case 6: // close
           break;
         case 7: // wait4
-          InterceptWait(pid2, ABIGetArg(pid2, 0), 0);
+          if (!InterceptWait(GetArg(0), 0)) {
+            continue;
+          }
           break;
         case 532: // wait6
-          InterceptWait(pid2, ABIGetArg(pid2, 1), 0);
+          if (!InterceptWait(GetArg(1), 0)) {
+            continue;
+          }
           break;
         case 9: // link
           PERMCHECK(W_OK, 1);
-          InterceptLink(pid2);
+          InterceptLink();
           break;
         case 10: // unlink
           PERMCHECK(W_OK, 0);
-          InterceptUnlink(pid2);
+          InterceptUnlink();
           break;
         case 12: { // chdir
           PERMCHECK(X_OK | F_OK, 0);
-          InterceptChdir(pid2);
+          InterceptChdir();
           break;
         }
         case 13: // fdchdir
 #define FPERMCHECK(af, PATH)                                                   \
   {                                                                            \
     char dst[1024];                                                            \
-    FdToStr(dst, pid2, ABIGetArg(pid2, 0));                                    \
-    if (0 != HasPerms((af), pid2, dst)) {                                      \
-      ABISetSyscall(pid2, 20); /*  Doesnt do anything*/                        \
-      ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);                                  \
-      waitpid(pid2, NULL, 0);                                                  \
-      ABISetReturn(pid2, -HasPerms((af), pid2, dst), 1);                       \
+    FdToStr(dst, GetArg(0));                                                   \
+    if (0 != HasPerms((af), dst)) {                                            \
+      SetSyscall(20); /*  Doesnt do anything*/                                 \
+      ToScx();                                                                 \
+      SetReturn(HasPerms((af), dst), 1);                                       \
       break;                                                                   \
     }                                                                          \
   }
           FPERMCHECK(X_OK | F_OK, 0);
-          FakeSuccess(pid2);
+          FakeSuccess();
           break;
         case 20: // getpid
           break;
         case 21: // mount
-          InterceptMount(pid2);
+          InterceptMount();
           break;
         case 22: // unmount
-          InterceptUnmount(pid2);
+          InterceptUnmount();
           break;
         case 26: // ptrace
-          InterceptPtrace(pid2);
+          InterceptPtrace();
           break;
         case 33: // access
           PERMCHECK(R_OK, 0);
-          InterceptAccess(pid2);
+          InterceptAccess();
           break;
         case 34: { // chflags
           /*
@@ -1702,15 +1748,14 @@ int main(int argc, const char *argv[], const char **env) {
            * SF_APPEND,SF_NOUNLINK,SF_IMMUATABLE
            * */
           PERMCHECK(W_OK | F_OK, 0);
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
         } break;
         case 35: { // fchflags
           /*
            * Look at 34:
            * */
           FPERMCHECK(W_OK | F_OK, 0);
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-          waitpid(pid2, NULL, 0);
+          ToScx();
         } break;
           break;
         case 37: { // kill
@@ -1718,11 +1763,11 @@ int main(int argc, const char *argv[], const char **env) {
            *other procs (TODO handle p<=0)
            **/
           CProcInfo *me = GetProcInfByPid(pid2);
-          pid_t want = ABIGetArg(pid2, 0);
-          int poo = ABIGetArg(pid2, 1);
+          pid_t want = GetArg(0);
+          int poo = GetArg(1);
           if (want > 0) {
             CProcInfo *cur;
-            ABISetSyscall(pid2, 20); // Dont do anyhthjing(getpid)
+            SetSyscall(20); // Dont do anyhthjing(getpid)
             for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
               if (want == cur->pid) {
                 /*21 Nrootconauto
@@ -1735,102 +1780,94 @@ int main(int argc, const char *argv[], const char **env) {
                  *
                  **/
                 if ((me->uid == 0 || me->euid == 0) || // Super user
-                    (cur->uid == me -> uid ||
+                    (cur->uid == me->uid ||
                      cur->euid == me->uid) || // cur->real
-                    (cur->uid == me -> euid ||
+                    (cur->uid == me->euid ||
                      cur->euid == me->euid) || // cur->euid
                     (poo == SIGCONT && (getsid(want) == getsid(pid2)))) {
-                  ptrace(PT_TO_SCX, pid2,(caddr_t) 1, 0);
-                  waitpid(pid2, NULL, 0);
+                  ToScx();
                   int e = kill(want, poo);
                   if (e)
-                    ABISetReturn(pid2, e, 1);
+                    SetReturn(e, 1);
                   else {
-                    ABISetReturn(pid2, 0, 0);
+                    SetReturn(0, 0);
                   }
                   break;
                 } else {
                   // Not permiteed 2 kill
-                  ptrace(PT_TO_SCX, pid2,(caddr_t) 1, 0);
-                  waitpid(pid2, NULL, 0);
-                  ABISetReturn(pid2, EPERM, 1);
+                  ToScx();
+                  SetReturn(-EPERM, 1);
                 }
               }
             }
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, ESRCH, 1);
+            ToScx();
+            SetReturn(-ESRCH, 1);
           }
         } break;
         case 39: // getppid TODO
           break;
         case 41: { // dup
-          CProcInfo *inf = GetProcInfByPid(pid2);
-          CHashEntry *ent;
-          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
+          ToScx();
         } break;
         case 43: { // getegid
           // TODO wut is an egid
           CProcInfo *inf = GetProcInfByPid(pid2);
-          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-          waitpid(pid2, NULL, 0);
-          ABISetReturn(pid2, inf->gid, 0);
+          ToScx();
+          SetReturn(inf->gid, 0);
         } break;
         case 47: { // getgid
           // TODO wut is an egid
           CProcInfo *inf = GetProcInfByPid(pid2);
-          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-          waitpid(pid2, NULL, 0);
-          ABISetReturn(pid2, inf->gid, 0);
+          ToScx();
+          SetReturn(inf->gid, 0);
         } break;
         case 49: { // getlogin
           CProcInfo *pinf = GetProcInfByPid(pid2);
-          // int64_t len = ABIGetArg(pid2, 1);
-          char *to = (char *)ABIGetArg(pid2, 0);
-          size_t len = ABIGetArg(pid2, 1);
-          ptrace(PT_TO_SCX, pid2, (void *)1, 0);
-          waitpid(pid2, NULL, 0);
+          // int64_t len = GetArg(pid2, 1);
+          char *to = (char *)GetArg(0);
+          size_t len = GetArg(1);
+          ToScx();
           const char *name = "???";
           if (pinf->login) {
             name = pinf->login;
           }
           if (to && len >= 1 + strlen(name)) {
-            WritePTraceString(NULL, pid2, to, name);
-            ABISetReturn(pid2, 0, 0);
+            WritePTraceString(NULL, to, name);
+            SetReturn(0, 0);
           } else {
-            ABISetReturn(pid2, ERANGE, 1);
+            SetReturn(-ERANGE, 1);
           }
         } break;
         case 50: // setlogin
         {
           char ln[MAXLOGNAME];
-          ReadPTraceString(ln, pid2, (char *)ABIGetArg(pid2, 0));
-          ABISetReturn(pid2, 0, 0); // TODO perms
+          ReadPTraceString(ln, (char *)GetArg(0));
+          SetReturn(0, 0); // TODO perms
         }
         case 54: // ioctl
           break;
         case 56: { // revoke
           PERMCHECK(W_OK | F_OK, 0);
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
         } break;
         case 57: { // symlink
           PERMCHECK(W_OK, 0);
           CProcInfo *inf = GetProcInfByPid(pid2);
           char name[1024];
-          ReadPTraceString(name, pid2, (char *)ABIGetArg(pid2, 0));
-          { INTERCEPT_FILE1(pid2, 1); }
+          ReadPTraceString(name, (char *)GetArg(0));
+          { INTERCEPT_FILE1(1); }
           char failed;
-          ABIGetReturn(pid2, &failed);
+          GetReturn(&failed);
           if (!failed) {
-            ChrootDftOwnership(name, pid2);
+            ChrootDftOwnership(name);
           }
         } break;
         case 58: // readlink
-          InterceptReadlink(pid2);
+          InterceptReadlink();
           break;
         case 59: { // execve
           PERMCHECK(X_OK | F_OK, 0);
-          InterceptExecve(pid2);
+          InterceptExecve();
         } break;
         case 61: // chroot TODO
           break;
@@ -1843,35 +1880,31 @@ int main(int argc, const char *argv[], const char **env) {
         case 79: // getgroups
         {
           CProcInfo *pinf = GetProcInfByPid(pid2);
-          long cnt = ABIGetArg(pid2, 0);
+          long cnt = GetArg(0);
           if (cnt < pinf->ngrps) {
             if (cnt > 0)
-              PTraceWrite(pid2, (void *)ABIGetArg(pid2, 1), pinf->groups,
+              PTraceWrite(mc_current_tid, (void *)GetArg(1), pinf->groups,
                           cnt * sizeof(gid_t));
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, EINVAL, 1);
+            ToScx();
+            SetReturn(-EINVAL, 1);
           } else {
-            PTraceWrite(pid2, (void *)ABIGetArg(pid2, 1), pinf->groups,
+            PTraceWrite(mc_current_tid, (void *)GetArg(1), pinf->groups,
                         pinf->ngrps * sizeof(gid_t));
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, pinf->ngrps, 0);
+            ToScx();
+            SetReturn(pinf->ngrps, 0);
           }
         } break;
         case 80: { // setgroups
           CProcInfo *pinf = GetProcInfByPid(pid2);
           if (pinf->uid == 0 || pinf->euid == 0) {
-            long cnt = ABIGetArg(pid2, 0);
+            long cnt = GetArg(0);
             pinf->ngrps = cnt;
-            PTraceRead(pid2, pinf->groups, (void *)ABIGetArg(pid2, 1),
+            PTraceRead(mc_current_tid, pinf->groups, (void *)GetArg(1),
                        cnt * sizeof(gid_t));
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, 0, 0);
+            ToScx();
+            SetReturn(0, 0);
           } else {
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
+            ToScx();
             // Failure
           }
         } break;
@@ -1895,24 +1928,24 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         case 15: // chmod
           PERMCHECK(W_OK, 0);
-          InterceptChmod(pid2);
+          InterceptChmod();
           break;
         case 16: // chown
           PERMCHECK(W_OK, 0);
-          InterceptChown(pid2);
+          InterceptChown();
           break;
         case 23: // setuid 21
-          InterceptSetuid(pid2);
+          InterceptSetuid();
           break;
         case 24: // getuid
-          InterceptGetuid(pid2);
+          InterceptGetuid();
           break;
         case 25: // geteuid
-          InterceptGeteuid(pid2);
+          InterceptGeteuid();
           break;
         case 124: { // fchmod
           FPERMCHECK(F_OK | W_OK, 0);
-          FakeSuccess(pid2);
+          FakeSuccess();
           break;
         }
         case 122: { // settimeofday
@@ -1925,13 +1958,11 @@ int main(int argc, const char *argv[], const char **env) {
           FPERMCHECK(F_OK | W_OK, 0);
           char who[1024];
           CProcInfo *pinf = GetProcInfByPid(pid2);
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-          waitpid(pid2, NULL, 0);
-          if (FdToStr(who, pid2, ABIGetArg(pid2, 0))) {
-            HashTableSet(who, ABIGetArg(pid2, 1), ABIGetArg(pid2, 2),
-                         FilePerms(who));
+          ToScx();
+          if (FdToStr(who, GetArg(0))) {
+            HashTableSet(who, GetArg(1), GetArg(2), FilePerms(who));
           }
-          ABISetReturn(pid2, 0, 0); // TODO success?
+          SetReturn(0, 0); // TODO success?
           break;
         }
         case 127: { // setregid
@@ -1940,15 +1971,15 @@ int main(int argc, const char *argv[], const char **env) {
                      * Normal users may only swp ugid<->egid
                      */
           CProcInfo *inf = GetProcInfByPid(pid2);
-          gid_t wantu = ABIGetArg(pid2, 0);
-          gid_t wante = ABIGetArg(pid2, 1);
+          gid_t wantu = GetArg(0);
+          gid_t wante = GetArg(1);
 
-          if ((inf->gid == 0 || inf->egid == 0) ||         // Superuser 21
-              (inf->gid == wante && inf->egid == wantu)// swap gid<->egid
+          if ((inf->gid == 0 || inf->egid == 0) ||      // Superuser 21
+              (inf->gid == wante && inf->egid == wantu) // swap gid<->egid
           ) {
             inf->gid = wantu;
             inf->egid = wante;
-            FakeSuccess(pid2);
+            FakeSuccess();
           } else if (wante == -1 || wantu == -1) {
             if (wante == inf->gid) {
               inf->egid = wante;
@@ -1956,11 +1987,10 @@ int main(int argc, const char *argv[], const char **env) {
             if (wantu == inf->egid) {
               inf->gid = wantu;
             }
-            FakeSuccess(pid2);
+            FakeSuccess();
           } else {
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, EPERM, 1);
+            ToScx();
+            SetReturn(-EPERM, 1);
           }
           break;
         }
@@ -1971,15 +2001,15 @@ int main(int argc, const char *argv[], const char **env) {
                      * Normal users may only swp uid<->euid
                      */
           CProcInfo *inf = GetProcInfByPid(pid2);
-          uid_t wantu = ABIGetArg(pid2, 0);
-          uid_t wante = ABIGetArg(pid2, 1);
+          uid_t wantu = GetArg(0);
+          uid_t wante = GetArg(1);
 
-          if ((inf->uid == 0 || inf->euid == 0) ||         // Superuser 21
-              (inf->uid == wante && inf->euid == wantu)// swap uid<->euid
+          if ((inf->uid == 0 || inf->euid == 0) ||      // Superuser 21
+              (inf->uid == wante && inf->euid == wantu) // swap uid<->euid
           ) {
             inf->uid = wantu;
             inf->euid = wante;
-            FakeSuccess(pid2);
+            FakeSuccess();
           } else if (wante == -1 || wantu == -1) {
             if (wante == inf->uid) {
               inf->euid = wante;
@@ -1987,11 +2017,10 @@ int main(int argc, const char *argv[], const char **env) {
             if (wantu == inf->euid) {
               inf->uid = wantu;
             }
-            FakeSuccess(pid2);
+            FakeSuccess();
           } else {
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, EPERM, 1);
+            ToScx();
+            SetReturn(-EPERM, 1);
           }
           break;
         }
@@ -2006,15 +2035,15 @@ int main(int argc, const char *argv[], const char **env) {
           char dst[1024], chr[1024], failed, chr2[1024];
           CProcInfo *inf = GetProcInfByPid(pid2);
           CHashEntry dummy, *ent = &dummy;
-          ReadPTraceString(dst, pid2, (char *)ABIGetArg(pid2, 1));
-          ReadPTraceString(chr, pid2, (char *)ABIGetArg(pid2, 0));
-          ChrootedRealpath(chr, pid2, chr);
+          ReadPTraceString(dst, (char *)GetArg(1));
+          ReadPTraceString(chr, (char *)GetArg(0));
+          ChrootedRealpath(chr, chr);
           uid_t u = FileUid(chr);
           gid_t g = FileGid(chr);
           uint32_t p = FilePerms(chr);
-          INTERCEPT_FILE2(pid2, 0, 1);
-          ABIGetReturn(pid2, &failed);
-          ChrootedRealpath(chr2, pid2, dst);
+          INTERCEPT_FILE2(0, 1);
+          GetReturn(&failed);
+          ChrootedRealpath(chr2, dst);
           if (!failed) {
             /* 21 Nroot here,renamin' keeps perms ok
              */
@@ -2030,42 +2059,42 @@ int main(int argc, const char *argv[], const char **env) {
           char dst[1024], failed;
           PERMCHECK(W_OK, 0);
           CProcInfo *inf = GetProcInfByPid(pid2);
-          ReadPTraceString(dst, pid2, (char *)ABIGetArg(pid2, 0));
-          INTERCEPT_FILE1(pid2, 0);
-          ABIGetReturn(pid2, &failed);
+          ReadPTraceString(dst, (char *)GetArg(0));
+          INTERCEPT_FILE1(0);
+          GetReturn(&failed);
           if (!failed)
-            ChrootDftOwnership(dst, pid2);
+            ChrootDftOwnership(dst);
         } break;
         case 136: { // mkdir
           char dst[1024], fail;
           PERMCHECK(W_OK, 0);
           CProcInfo *inf = GetProcInfByPid(pid2);
-          ReadPTraceString(dst, pid2, (char *)ABIGetArg(pid2, 0));
-          { INTERCEPT_FILE1(pid2, 0); }
-          ABIGetReturn(pid2, &fail);
+          ReadPTraceString(dst, (char *)GetArg(0));
+          { INTERCEPT_FILE1(0); }
+          GetReturn(&fail);
           if (!fail) {
-            ChrootDftOwnership(dst, pid2);
+            ChrootDftOwnership(dst);
           }
         } break;
         case 137: { // rmdir
           PERMCHECK(W_OK | F_OK, 0);
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
           break;
         }
         case 138: { // utimes
           PERMCHECK(W_OK | F_OK, 0);
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
         } break;
         case 147: // setsid TODO?
           break;
         case 148: { // qoutactl
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
         } break;
         case 161 ... 162: { // lgetfh
                             /* 21 Nrootconauto here,
                              *   What permisions does it need?
                              */
-          INTERCEPT_FILE1(pid2, 0);
+          INTERCEPT_FILE1(0);
         } break;
         case 165: // sysarch
           break;
@@ -2076,557 +2105,553 @@ int main(int argc, const char *argv[], const char **env) {
            *gid/egid
            **/
           CProcInfo *inf = GetProcInfByPid(pid2);
-          uid_t want = ABIGetArg(pid2, 0);
+          uid_t want = GetArg(0);
           if ((!inf->euid || !inf->uid) ||               // Super user
               (inf->gid == want || inf->egid == want)) { // uid or euid 21
             inf->sgid = inf->egid = inf->gid = want;
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, 0, 0);
+            ToScx();
+            SetReturn(0, 0);
           } else {
-            ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-            waitpid(pid2, NULL, 0);
-            ABISetReturn(pid2, EPERM, 1);
+            ToScx();
+            SetReturn(-EPERM, 1);
           }
         } break;
         case 182: // setegid
         {
           CProcInfo *inf = GetProcInfByPid(pid2);
-          uid_t want = ABIGetArg(pid2, 0);
-          if((!inf->euid||!inf->uid)|| //Super user
-			(inf->gid==want||inf->egid==want)) { //uid or euid 21
-          inf->egid = want;
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-          waitpid(pid2, NULL, 0);
-          ABISetReturn(pid2, 0, 0);
-        }
-          else {
-            ABISetReturn(pid2, EPERM, 1);
+          uid_t want = GetArg(0);
+          if ((!inf->euid || !inf->uid) ||               // Super user
+              (inf->gid == want || inf->egid == want)) { // uid or euid 21
+            inf->egid = want;
+            ToScx();
+            SetReturn(0, 0);
+          } else {
+            SetReturn(-EPERM, 1);
           }
-        }
-        break;
-      case 183: // seteuid
-      {
-        CProcInfo *inf = GetProcInfByPid(pid2);
-        uid_t want = ABIGetArg(pid2, 0);
-        if((!inf->euid||!inf->uid)|| //Super user
-			(inf->uid==want||inf->euid==want)) {//uid or euid 21
-          inf->euid = want;
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-          waitpid(pid2, NULL, 0);
-          ABISetReturn(pid2, 0, 0);
-    } else {
-          ABISetReturn(pid2, EPERM, 1);
+        } break;
+        case 183: // seteuid
+        {
+          CProcInfo *inf = GetProcInfByPid(pid2);
+          uid_t want = GetArg(0);
+          if ((!inf->euid || !inf->uid) ||               // Super user
+              (inf->uid == want || inf->euid == want)) { // uid or euid 21
+            inf->euid = want;
+            ToScx();
+            SetReturn(0, 0);
+          } else {
+            SetReturn(-EPERM, 1);
           }
-      } break;
-      case 191: { // pathconf
-        PERMCHECK(F_OK | R_OK, 0);
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 192: { // lpathconf
-        PERMCHECK(F_OK | R_OK, 0);
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 198: { // 64bit syscall
-        break;
-      }
-      case 202: { // sysctl
-        /* 21 Nroot here,ask him to add sysctls
-         *  Keep in mind this is basically a poor man's hypervisor which runs
-         * in userspace
-         *
-         */
-        break;
-      }
-      case 204: { // undelete
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 206: {
-        FPERMCHECK(W_OK, 0);
-        AtSytle(NULL, pid2, 0,1);
-        break;
-      }
-      case 207: // getpgid
-        break;
-      case 253: // issetugid
-                /* 21 Nrootconauto
-                 * Im  not taitned,lets just leave it at that
-                 */
-        FakeSuccess(pid2);
-        break;
-      case 254: { // lchown
-        PERMCHECK(W_OK, 0);
-        InterceptChown(pid2);
-      } break;
-      case 274: { // luchmod
-        PERMCHECK(W_OK | F_OK, 0);
-        InterceptChmod(pid2);
-      } break;
-      case 276: { // lutimes
-        PERMCHECK(W_OK | F_OK, 0);
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 326: // getcwd
-        Intercept__Getcwd(pid2);
-        break;
-      case 338: // jail
-        /* 21 Nroot
-         *   Stay tuned.
-         */
-        break;
-      case 340: // sigprocmask
-        break;
-      case 311: { // setresuid
-        uid_t u = ABIGetArg(pid2, 0);
-        uid_t e = ABIGetArg(pid2, 1);
-        uid_t s = ABIGetArg(pid2, 2);
-        CProcInfo *pinf = GetProcInfByPid(pid2);
-        pinf->suid = s;
-        pinf->euid = e;
-        pinf->uid = u;
-        // TODO perms
-        FakeSuccess(pid2);
-        break;
-      }
-      case 312: { // setresgid
-        CProcInfo *pinf = GetProcInfByPid(pid2);
-        if (pinf->uid == 0 || pinf->uid == 0) {
-          uid_t u = ABIGetArg(pid2, 0);
-          uid_t e = ABIGetArg(pid2, 1);
-          uid_t s = ABIGetArg(pid2, 2);
-          if (s != -1)
-            pinf->sgid = s;
-          if (u != -1)
-            pinf->gid = u;
-          if (e != -1)
-            pinf->egid = e;
-          FakeSuccess(pid2);
-        } else {
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-          waitpid(pid2, NULL, 0);
-          ABISetReturn(pid2,EPERM, 1);
+        } break;
+        case 191: { // pathconf
+          PERMCHECK(F_OK | R_OK, 0);
+          INTERCEPT_FILE1(0);
+        } break;
+        case 192: { // lpathconf
+          PERMCHECK(F_OK | R_OK, 0);
+          INTERCEPT_FILE1(0);
+        } break;
+        case 198: { // 64bit syscall
+          break;
         }
-        break;
-      }
-      case 360: { // getresuid
-        CProcInfo *pinf = GetProcInfByPid(pid2);
-        uid_t *up = (uid_t *)ABIGetArg(pid2, 0);
-        uid_t *ep = (uid_t *)ABIGetArg(pid2, 1);
-        uid_t *sp = (uid_t *)ABIGetArg(pid2, 2);
-        PTraceWrite(pid2, up, &pinf->uid, sizeof(uid_t));
-        PTraceWrite(pid2, ep, &pinf->euid, sizeof(uid_t));
-        PTraceWrite(pid2, sp, &pinf->suid, sizeof(uid_t));
-        FakeSuccess(pid2);
-        break;
-      }
-      case 361: { // getresgid
-        CProcInfo *pinf = GetProcInfByPid(pid2);
-        gid_t *up = (gid_t *)ABIGetArg(pid2, 0);
-        gid_t *ep = (gid_t *)ABIGetArg(pid2, 1);
-        gid_t *sp = (gid_t *)ABIGetArg(pid2, 2);
-        PTraceWrite(pid2, up, &pinf->gid, sizeof(gid_t));
-        PTraceWrite(pid2, ep, &pinf->egid, sizeof(gid_t));
-        PTraceWrite(pid2, sp, &pinf->sgid, sizeof(gid_t));
-        FakeSuccess(pid2);
-        break;
-      }
-      //__acl_xxxx_file
-      case 347:
-      case 348:
-      case 351:
-      case 353: {
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 356 ... 358: { //	extattr_set_file	extattr_get_file
-                          // extattr_delete_file
-        INTERCEPT_FILE1(pid2, 0);
-      }
-      case 376: { // eaccess
-        PERMCHECK(R_OK, 0);
-        InterceptAccess(pid2);
-      } break;
-      case 378: // nmount
-        InterceptNmount(pid2);
-        break;
-      case 387:
-      case 389: { //__mac_get_file/__mac_set_file
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 391: { // lchflags
-        PERMCHECK(W_OK | F_OK, 0);
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 409:
-      case 411: { // mac_get_link/set_link
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 425 : //__acl_get_lni
-			 PERMCHECK(R_OK,0);
-        {INTERCEPT_FILE1(pid2, 0);}
-			break;
-			case 426 : //__acl_set_link
-			 PERMCHECK(W_OK,0);
-			 {INTERCEPT_FILE1(pid2, 0);}
-			break;
-			case 427 : //__acl_delte_link
-			 PERMCHECK(W_OK,0);
-			 {INTERCEPT_FILE1(pid2, 0);}
-			break;
-      case 438:
-      case 439:
-      case 450:;
-      case 412 ... 414: { // extattr_set_link/get_link/delete_link
-        INTERCEPT_FILE1(pid2, 0);
-      } break;
-      case 416: // sigaction
-        break;
-      case 417: // sigreturn
-        break;
-      case 436: // jail_attach
-        break;
-      case 475: // pread
-        break;
-      case 476: // pwrite
-        break;
-      case 477: // mmap
-        break;
-      case 479: // truncate
-        PERMCHECK(W_OK | F_OK, 0);
-        InterceptAccessTruncate(pid2);
-        break;
-      case 480: // ltruncate
-        PERMCHECK(W_OK | F_OK, 0);
-        InterceptAccessTruncate(pid2);
-        break;
+        case 202: { // sysctl
+          /* 21 Nroot here,ask him to add sysctls
+           *  Keep in mind this is basically a poor man's hypervisor which runs
+           * in userspace
+           *
+           */
+          break;
+        }
+        case 204: { // undelete
+          INTERCEPT_FILE1(0);
+        } break;
+        case 206: {
+          FPERMCHECK(W_OK, 0);
+          AtSytle(NULL, 0, 1);
+          break;
+        }
+        case 207: // getpgid
+          break;
+        case 253: // issetugid
+                  /* 21 Nrootconauto
+                   * Im  not taitned,lets just leave it at that
+                   */
+          FakeSuccess();
+          break;
+        case 254: { // lchown
+          PERMCHECK(W_OK, 0);
+          InterceptChown();
+        } break;
+        case 274: { // luchmod
+          PERMCHECK(W_OK | F_OK, 0);
+          InterceptChmod();
+        } break;
+        case 276: { // lutimes
+          PERMCHECK(W_OK | F_OK, 0);
+          INTERCEPT_FILE1(0);
+        } break;
+        case 326: // getcwd
+          Intercept__Getcwd();
+          break;
+        case 338: // jail
+          /* 21 Nroot
+           *   Stay tuned.
+           */
+          break;
+        case 340: // sigprocmask
+          break;
+        case 311: { // setresuid
+          uid_t u = GetArg(0);
+          uid_t e = GetArg(1);
+          uid_t s = GetArg(2);
+          CProcInfo *pinf = GetProcInfByPid(pid2);
+          pinf->suid = s;
+          pinf->euid = e;
+          pinf->uid = u;
+          // TODO perms
+          FakeSuccess();
+          break;
+        }
+        case 312: { // setresgid
+          CProcInfo *pinf = GetProcInfByPid(pid2);
+          if (pinf->uid == 0 || pinf->uid == 0) {
+            uid_t u = GetArg(0);
+            uid_t e = GetArg(1);
+            uid_t s = GetArg(2);
+            if (s != -1)
+              pinf->sgid = s;
+            if (u != -1)
+              pinf->gid = u;
+            if (e != -1)
+              pinf->egid = e;
+            FakeSuccess();
+          } else {
+            ToScx();
+            SetReturn(-EPERM, 1);
+          }
+          break;
+        }
+        case 360: { // getresuid
+          CProcInfo *pinf = GetProcInfByPid(pid2);
+          uid_t *up = (uid_t *)GetArg(0);
+          uid_t *ep = (uid_t *)GetArg(1);
+          uid_t *sp = (uid_t *)GetArg(2);
+          PTraceWrite(mc_current_tid, up, &pinf->uid, sizeof(uid_t));
+          PTraceWrite(mc_current_tid, ep, &pinf->euid, sizeof(uid_t));
+          PTraceWrite(mc_current_tid, sp, &pinf->suid, sizeof(uid_t));
+          FakeSuccess();
+          break;
+        }
+        case 361: { // getresgid
+          CProcInfo *pinf = GetProcInfByPid(pid2);
+          gid_t *up = (gid_t *)GetArg(0);
+          gid_t *ep = (gid_t *)GetArg(1);
+          gid_t *sp = (gid_t *)GetArg(2);
+          PTraceWrite(mc_current_tid, up, &pinf->gid, sizeof(gid_t));
+          PTraceWrite(mc_current_tid, ep, &pinf->egid, sizeof(gid_t));
+          PTraceWrite(mc_current_tid, sp, &pinf->sgid, sizeof(gid_t));
+          FakeSuccess();
+          break;
+        }
+        //__acl_xxxx_file
+        case 347:
+        case 348:
+        case 351:
+        case 353: {
+          INTERCEPT_FILE1(0);
+        } break;
+        case 356 ... 358: { //	extattr_set_file	extattr_get_file
+                            // extattr_delete_file
+          INTERCEPT_FILE1(0);
+        }
+        case 376: { // eaccess
+          PERMCHECK(R_OK, 0);
+          InterceptAccess();
+        } break;
+        case 378: // nmount
+          InterceptNmount();
+          break;
+        case 387:
+        case 389: { //__mac_get_file/__mac_set_file
+          INTERCEPT_FILE1(0);
+        } break;
+        case 391: { // lchflags
+          PERMCHECK(W_OK | F_OK, 0);
+          INTERCEPT_FILE1(0);
+        } break;
+        case 409:
+        case 411: { // mac_get_link/set_link
+          INTERCEPT_FILE1(0);
+        } break;
+        case 425: //__acl_get_lni
+          PERMCHECK(R_OK, 0);
+          { INTERCEPT_FILE1(0); }
+          break;
+        case 426: //__acl_set_link
+          PERMCHECK(W_OK, 0);
+          { INTERCEPT_FILE1(0); }
+          break;
+        case 427: //__acl_delte_link
+          PERMCHECK(W_OK, 0);
+          { INTERCEPT_FILE1(0); }
+          break;
+        case 438:
+        case 439:
+        case 450:;
+        case 412 ... 414: { // extattr_set_link/get_link/delete_link
+          INTERCEPT_FILE1(0);
+        } break;
+        case 416: // sigaction
+          break;
+        case 417: // sigreturn
+          break;
+        case 436: // jail_attach
+          break;
+        case 475: // pread
+          break;
+        case 476: // pwrite
+          break;
+        case 477: // mmap
+          break;
+        case 479: // truncate
+          PERMCHECK(W_OK | F_OK, 0);
+          InterceptAccessTruncate();
+          break;
+        case 480: // ltruncate
+          PERMCHECK(W_OK | F_OK, 0);
+          InterceptAccessTruncate();
+          break;
 
-      case 483: // shm_unlink
-        PERMCHECK(W_OK | F_OK, 0);
-        InterceptAccessShmUnlink(pid2);
-        break;
-      case 489: { // faccessat
+        case 483: // shm_unlink
+          PERMCHECK(W_OK | F_OK, 0);
+          InterceptAccessShmUnlink();
+          break;
+        case 489: { // faccessat
 #define FATPERMCHECK(write_to, af, FD, PATH)                                   \
   {                                                                            \
     char dst[1024], full[1024];                                                \
-    ReadPTraceString(dst, pid2, (char *)ABIGetArg(pid2, PATH));                \
+    ReadPTraceString(dst, (char *)GetArg(PATH));                               \
     if (dst[0] == '/')                                                         \
       strcpy(full, dst);                                                       \
     else {                                                                     \
-      FdToStr(full, pid2, ABIGetArg(pid2, FD));                                \
+      FdToStr(full, GetArg(FD));                                               \
       strcat(full, "/");                                                       \
       strcat(full, dst);                                                       \
     }                                                                          \
     if (write_to)                                                              \
       strcpy((write_to), full);                                                \
-    if (0 != HasPerms((af), pid2, full)) {                                     \
-      ABISetSyscall(pid2, 20); /*  Doesnt do anything*/                        \
-      ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);                                  \
-      waitpid(pid2, NULL, 0);                                                  \
-      ABISetReturn(pid2, -HasPerms((af), pid2, dst), 1);                       \
+    if (0 != HasPerms((af), full)) {                                           \
+      SetSyscall(20); /*  Doesnt do anything*/                                 \
+      ToScx();                                                                 \
+      SetReturn(HasPerms((af), dst), 1);                                       \
       break;                                                                   \
     }                                                                          \
   }
-        FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
-        char dst[1024];
-        AtSytle(dst, pid2, 0, 1);
-        break;
-      }
+          FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
+          char dst[1024];
+          AtSytle(dst, 0, 1);
+          break;
+        }
 
-      case 490: // fchmodat
-      {
-        char use[1024];
-        FATPERMCHECK(use, W_OK | F_OK, 0, 1);
-        UnChrootPath(use, use);
-        HashTableSet(use, FileUid(use), FileGid(use), ABIGetArg(pid2, 2));
-        AtSytle(NULL, pid2, 0, 1);
-        ABISetReturn(pid2, 0, 0);
-        break;
-      }
-      case 491: { // fchownat
-        char use[1024], failed;
-        FATPERMCHECK(use, W_OK | F_OK, 0, 1);
-        CProcInfo *inf = GetProcInfByPid(pid2);
-        AtSytle(use, pid2, 0, 1);
-        ABIGetReturn(pid2, &failed);
-        if (!failed) {
+        case 490: // fchmodat
+        {
+          char use[1024];
+          FATPERMCHECK(use, W_OK | F_OK, 0, 1);
           UnChrootPath(use, use);
-          HashTableSet(use, ABIGetArg(pid2, 2), ABIGetArg(pid2, 3),
-                       FilePerms(use));
+          HashTableSet(use, FileUid(use), FileGid(use), GetArg(2));
+          AtSytle(NULL, 0, 1);
+          SetReturn(0, 0);
+          break;
         }
-        ABISetReturn(pid2, 0, 0);
-        break;
-      }
-      case 492: // fexecve 21
-        /* 21 Nrootconauto
-         *  Ask him to do this
-         */
-        AtSytle(NULL, pid2, 0, 1);
-        break;
-      case 494: // futimesat
-        FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
-        AtSytle(NULL, pid2, 0, 1);
-        break;
-      case 495: // linkat
-        FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
-        FATPERMCHECK(NULL, W_OK, 2, 3);
-        InterceptLinkat(pid2);
-        break;
-      case 496: { // mkdirat
-        char dst[1024];
-        FATPERMCHECK(NULL, W_OK, 0, 1);
-        AtSytle(dst, pid2, 0, 1);
-        CProcInfo *inf = GetProcInfByPid(pid2);
-        UnChrootPath(dst, dst);
-        HashTableSet(dst, inf->uid, inf->gid, 0755);
-      } break;
-      case 497: { // mkfifoat
-        FATPERMCHECK(NULL, W_OK, 0, 1);
-        char dst[1024];
-        AtSytle(dst, pid2, 0, 1);
-        CProcInfo *inf = GetProcInfByPid(pid2);
-        UnChrootPath(dst, dst);
-        HashTableSet(dst, inf->uid, inf->gid, 0644);
-      } break;
-      case 499: { // openat	
-        char dst[1024], failed;
-        AtSytle(dst, pid2, 0, 1);
-        CProcInfo *inf = GetProcInfByPid(pid2);
-        int64_t fd = ABIGetReturn(pid2, &failed);
-        if (!failed) {
-          if (ABIGetArg(pid2, 2) & O_CREAT) {
-            HashTableSet(dst, inf->uid, inf->gid, 0755);
+        case 491: { // fchownat
+          char use[1024], failed;
+          FATPERMCHECK(use, W_OK | F_OK, 0, 1);
+          CProcInfo *inf = GetProcInfByPid(pid2);
+          AtSytle(use, 0, 1);
+          GetReturn(&failed);
+          if (!failed) {
+            UnChrootPath(use, use);
+            HashTableSet(use, GetArg(2), GetArg(3), FilePerms(use));
           }
+          SetReturn(0, 0);
+          break;
         }
-      } break;
-      case 500: { // readllnkat
-        FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
-        char dst[1024];
-        char *b = (char *)ABIGetArg(pid2, 2);
-        int64_t l = ABIGetArg(pid2, 3);
-        AtSytle(dst, pid2, 0, 1);
-      } break;
-      case 501: { // renameat
-        char tweenty[1024];
-        char one[1024], failed;
-        FATPERMCHECK(tweenty, W_OK, 2, 3);
-        FATPERMCHECK(one, R_OK, 0, 1);
-        UnChrootPath(one, one);
-        UnChrootPath(tweenty, tweenty);
-        uid_t u = FileUid(one);
-        gid_t g = FileGid(one);
-        uint32_t p = FilePerms(one);
-        InterceptLinkat(pid2); // CLose enough
-        ABIGetReturn(pid2, &failed);
-        if (!failed) {
-          /* 21 Nroot here,renamin' keeps perms ok
+        case 492: // fexecve 21
+          /* 21 Nrootconauto
+           *  Ask him to do this
            */
-          HashTableRemove(one);
-          HashTableSet(tweenty, u, g, p);
-        }
-      } break;
-      case 502: { // symlinkat
-        char dst[1024];
-        FATPERMCHECK(NULL, W_OK, 0, 1);
-        AtSytle(dst, pid2, 1, 2);
-        break;
-      }
-      case 503: // unlnikat
-      {
-        char del[1024];
-        FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
-        AtSytle(del, pid2, 0, 1);
-        UnChrootPath(del, del);
-        HashTableRemove(del);
-      } break;
-      case 506 ... 508: // jail stuff TODO
-        break;
-      case 513: // lpathcnf
-        FPERMCHECK(R_OK, NULL)
-        INTERCEPT_FILE1(pid2, 0);
-        break;
-      case 523: // getloginclass
-        // TODO
-        FakeSuccess(pid2);
-        break;
-      case 524: // setloginclass
-        FakeSuccess(pid2);
-        break;
-      case 546: // futimes
-        FPERMCHECK(W_OK, 0);
-        ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-        waitpid(pid2, NULL, 0);
-        ABISetReturn(pid2, 0, 0);
-        break;
-      case 547: // utimenat
-        FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
-        AtSytle(NULL, pid2, 0, 1);
-        break;
-      case 551: // fstat
-                // FPERMCHECK(R_OK|F_OK,0);
-        InterceptFstat(pid2);
-        break;
-      case 552: { // fstatat
-                  // FATPERMCHECK(NULL,R_OK|F_OK,0,1);
-        InterceptFstatat(pid2);
-      } break;
-      case 553:
-        break;
-      case 554: // getdirentries
-        // Filename is from fd
-        break;
-      case 540: // chflagsat
-        FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
-        AtSytle(NULL, pid2, 0, 1);
-        break;
-        break;
-      case 556: // fstatfs
-        break;
-      case 559: { // mknodat
-                  // Only super uses can make nodes
-                  // AtSytle(NULL, pid2, 0, 1);
-      } break;
-      case 563: // getrandom
-        break;
-
-      case 564: { // getfhat
-        FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
-        AtSytle(NULL, pid2, 0, 1);
-      } break;
-      case 565: { // fhlink
-        FPERMCHECK(W_OK, 1);
-        INTERCEPT_FILE1(pid2, 1);
-      } break;
-      case 566: { // fhlinkat
-        FATPERMCHECK(NULL, W_OK, 1, 2);
-        AtSytle(NULL, pid, 1, 2);
-      } break;
-      case 568: { // funlinkat
-        FATPERMCHECK(NULL, W_OK | F_OK, 1, 2);
-        AtSytle(NULL, pid, 1, 2);
-      } break;
-      case 572: // shm_rename
-        InterceptShmRename(pid2);
-        break;
-      case 573: // sigfastblock
-        break;
-      case 574: // realpathat
-      {
-        FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
-        InterceptRealPathAt(pid2);
-        break;
-      }
-      default:;
-      }
-      goto defacto;
-    }
-    else {
-    defacto:
-      if (pinf->flags & PIF_TO_SCX_ONLY) {
-        pinf->flags &= ~PIF_TO_SCX_ONLY;
-        ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
-        continue;
-      }
-      if (!(pinf->flags & PIF_WAITING)) {
-        if (WIFSTOPPED(cond)) {
-          if (WSTOPSIG(cond) != SIGTRAP || pinf->debugged_by) {
-            pid_t debugged_by = pinf->debugged_by;
-            if (!debugged_by) {
-              ptrace(PT_TO_SCE, pid2, (void *)1,
-                     WSTOPSIG(cond)); // !=SIGTAP
-            } else if (debugged_by) {
-              if (WSTOPSIG(cond) == SIGTRAP &&
-                  !!(inf.pl_flags & (PL_FLAG_SCE | PL_FLAG_SCX))) {
-                goto ignore;
-              }
-              DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
-              kill(debugged_by, SIGCHLD);
+          AtSytle(NULL, 0, 1);
+          break;
+        case 494: // futimesat
+          FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
+          AtSytle(NULL, 0, 1);
+          break;
+        case 495: // linkat
+          FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
+          FATPERMCHECK(NULL, W_OK, 2, 3);
+          InterceptLinkat();
+          break;
+        case 496: { // mkdirat
+          char dst[1024];
+          FATPERMCHECK(NULL, W_OK, 0, 1);
+          AtSytle(dst, 0, 1);
+          CProcInfo *inf = GetProcInfByPid(pid2);
+          UnChrootPath(dst, dst);
+          HashTableSet(dst, inf->uid, inf->gid, 0755);
+        } break;
+        case 497: { // mkfifoat
+          FATPERMCHECK(NULL, W_OK, 0, 1);
+          char dst[1024];
+          AtSytle(dst, 0, 1);
+          CProcInfo *inf = GetProcInfByPid(pid2);
+          UnChrootPath(dst, dst);
+          HashTableSet(dst, inf->uid, inf->gid, 0644);
+        } break;
+        case 499: { // openat
+          char dst[1024], failed;
+          AtSytle(dst, 0, 1);
+          CProcInfo *inf = GetProcInfByPid(pid2);
+          int64_t fd = GetReturn(&failed);
+          if (!failed) {
+            if (GetArg(2) & O_CREAT) {
+              HashTableSet(dst, inf->uid, inf->gid, 0755);
             }
-            UpdateWaits();
-            continue;
           }
+        } break;
+        case 500: { // readllnkat
+          FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
+          char dst[1024];
+          char *b = (char *)GetArg(2);
+          int64_t l = GetArg(3);
+          AtSytle(dst, 0, 1);
+        } break;
+        case 501: { // renameat
+          char tweenty[1024];
+          char one[1024], failed;
+          FATPERMCHECK(tweenty, W_OK, 2, 3);
+          FATPERMCHECK(one, R_OK, 0, 1);
+          UnChrootPath(one, one);
+          UnChrootPath(tweenty, tweenty);
+          uid_t u = FileUid(one);
+          gid_t g = FileGid(one);
+          uint32_t p = FilePerms(one);
+          InterceptLinkat(); // CLose enough
+          GetReturn(&failed);
+          if (!failed) {
+            /* 21 Nroot here,renamin' keeps perms ok
+             */
+            HashTableRemove(one);
+            HashTableSet(tweenty, u, g, p);
+          }
+        } break;
+        case 502: { // symlinkat
+          char dst[1024];
+          FATPERMCHECK(NULL, W_OK, 0, 1);
+          AtSytle(dst, 1, 2);
+          break;
         }
-      ignore:;
-        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        case 503: // unlnikat
+        {
+          char del[1024];
+          FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
+          AtSytle(del, 0, 1);
+          UnChrootPath(del, del);
+          HashTableRemove(del);
+        } break;
+        case 506 ... 508: // jail stuff TODO
+          break;
+        case 513: // lpathcnf
+          FPERMCHECK(R_OK, NULL)
+          INTERCEPT_FILE1(0);
+          break;
+        case 523: // getloginclass
+          // TODO
+          FakeSuccess();
+          break;
+        case 524: // setloginclass
+          FakeSuccess();
+          break;
+        case 544: { // procctl
+          idtype_t idt = GetArg(0);
+          long id = GetArg(1);
+          int cmd = GetArg(2);
+          SetSyscall(20); // do nothing
+          ToScx();
+          SetReturn(-EBUSY, 1);
+          break;
+        }
+        case 546: // futimes
+          FPERMCHECK(W_OK, 0);
+          ToScx();
+          SetReturn(0, 0);
+          break;
+        case 547: // utimenat
+          FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
+          AtSytle(NULL, 0, 1);
+          break;
+        case 551: // fstat
+                  // FPERMCHECK(R_OK|F_OK,0);
+          InterceptFstat();
+          break;
+        case 552: { // fstatat
+                    // FATPERMCHECK(NULL,R_OK|F_OK,0,1);
+          InterceptFstatat();
+        } break;
+        case 553:
+          break;
+        case 554: // getdirentries
+          // Filename is from fd
+          break;
+        case 540: // chflagsat
+          FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
+          AtSytle(NULL, 0, 1);
+          break;
+          break;
+        case 556: // fstatfs
+          break;
+        case 559: { // mknodat
+                    // Only super uses can make nodes
+                    // AtSytle(NULL, pid2, 0, 1);
+        } break;
+        case 563: // getrandom
+          break;
+
+        case 564: { // getfhat
+          FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
+          AtSytle(NULL, 0, 1);
+        } break;
+        case 565: { // fhlink
+          FPERMCHECK(W_OK, 1);
+          INTERCEPT_FILE1(1);
+        } break;
+        case 566: { // fhlinkat
+          FATPERMCHECK(NULL, W_OK, 1, 2);
+          AtSytle(NULL, 1, 2);
+        } break;
+        case 568: { // funlinkat
+          FATPERMCHECK(NULL, W_OK | F_OK, 1, 2);
+          AtSytle(NULL, 1, 2);
+        } break;
+        case 572: // shm_rename
+          InterceptShmRename();
+          break;
+        case 573: // sigfastblock
+          break;
+        case 574: // realpathat
+        {
+          FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
+          InterceptRealPathAt();
+          break;
+        }
+        default:;
+        }
+        goto defacto;
+      } else {
+      defacto:
+        if (pinf->flags & PIF_TO_SCX_ONLY) {
+          pinf->flags &= ~PIF_TO_SCX_ONLY;
+          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
+          continue;
+        }
+        if (!(pinf->flags & PIF_WAITING)) {
+          if (WIFSTOPPED(cond)) {
+            if (WSTOPSIG(cond) != SIGTRAP || pinf->debugged_by) {
+              pid_t debugged_by = pinf->debugged_by;
+              if (!debugged_by) {
+                ptrace(PT_TO_SCE, pid2, (void *)1,
+                       WSTOPSIG(cond)); // !=SIGTAP
+              } else if (debugged_by) {
+                if (WSTOPSIG(cond) == SIGTRAP &&
+                    !!(inf.pl_flags & (PL_FLAG_SCE | PL_FLAG_SCX))) {
+                  goto ignore;
+                }
+                DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
+                kill(debugged_by, SIGCHLD);
+              }
+              UpdateWaits();
+              continue;
+            }
+          }
+        ignore:;
+          ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
+        }
       }
     }
-  }
-}
-else if (!tflag) {
-  const char *dummy_argv[argc - 2 + 1 + 1];
-  int64_t r, has_ld_preload;
-  dummy_argv[0] = prog;
-  for (idx = 0; idx != argc - 2; idx++)
-    dummy_argv[idx + 1] = argv[idx + 2];
-  dummy_argv[argc - 2 + 1] = NULL;
-  ptrace(PT_TRACE_ME, pid, NULL, 0);
-  GetChrootedPath(chroot_bin, pid, prog);
-  int f, f2;
-  // Add libpl_hack.so to the chroot to patch elf_aux_info
+  } else if (!tflag) {
+    const char *dummy_argv[argc - 2 + 1 + 1];
+    int64_t r, has_ld_preload;
+    dummy_argv[0] = prog;
+    for (idx = 0; idx != argc - 2; idx++)
+      dummy_argv[idx + 1] = argv[idx + 2];
+    dummy_argv[argc - 2 + 1] = NULL;
+    ptrace(PT_TRACE_ME, pid, NULL, 0);
+    GetChrootedPath(chroot_bin, prog);
+    int f, f2;
+    // Add libpl_hack.so to the chroot to patch elf_aux_info
 #define DLLNAME "libpl_hack.so"
-  if (-1 == (f = open(DLLNAME, O_RDONLY))) {
-    fprintf(stderr,
-            "I need the " DLLNAME " file to patch elf_aux_info please.\n");
-    return 1;
-  }
-  struct stat fst;
-  fstat(f, &fst);
-  char *chroot_root = realpath(chroot, NULL);
-  chdir(chroot);
-  if (access(DLLNAME, F_OK)) {
+    if (-1 == (f = open(DLLNAME, O_RDONLY))) {
+      fprintf(stderr,
+              "I need the " DLLNAME " file to patch elf_aux_info please.\n");
+      return 1;
+    }
     struct stat fst;
     fstat(f, &fst);
-    f2 = open(DLLNAME, O_WRONLY | O_CREAT, 0755);
-    ssize_t wrb;
-    for (off_t o = 0; o < fst.st_size; o += wrb) {
-      wrb = copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
-      if (-1 == wrb) {
-        fprintf(stderr, "Failed copying library: %s\n", strerror(errno));
-        return 1;
+    char *chroot_root = realpath(chroot, NULL);
+    chdir(chroot);
+    if (access(DLLNAME, F_OK)) {
+      struct stat fst;
+      fstat(f, &fst);
+      f2 = open(DLLNAME, O_WRONLY | O_CREAT, 0755);
+      ssize_t wrb;
+      for (off_t o = 0; o < fst.st_size; o += wrb) {
+        wrb = copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
+        if (-1 == wrb) {
+          fprintf(stderr, "Failed copying library: %s\n", strerror(errno));
+          return 1;
+        }
       }
-    }
-    close(f2);
-  } else
-    chmod(DLLNAME, 0755);
-  close(f);
-  char nenv_d[256][1024];
-  char *nenv[256];
-  has_ld_preload = 0;
-  for (r = 0; env[r]; r++) {
-    if (Startswith(env[r], "LD_PRELOAD=") && 0) {
-      has_ld_preload = 1;
-      snprintf(nenv_d[r], sizeof *nenv_d, "%s %s", env[r], "/" DLLNAME);
+      close(f2);
     } else
-      strcpy(nenv_d[r], env[r]);
-    nenv[r] = nenv_d[r];
-  }	
-  if (!has_ld_preload) {
-    sprintf(nenv_d[r], "LD_PRELOAD=/%s", DLLNAME);
-    nenv[r] = nenv_d[r];
+      chmod(DLLNAME, 0755);
+    close(f);
+    char nenv_d[256][1024];
+    char *nenv[256];
+    has_ld_preload = 0;
+    for (r = 0; env[r]; r++) {
+      if (Startswith(env[r], "LD_PRELOAD=") && 0) {
+        has_ld_preload = 1;
+        snprintf(nenv_d[r], sizeof *nenv_d, "%s %s", env[r], "/" DLLNAME);
+      } else
+        strcpy(nenv_d[r], env[r]);
+      nenv[r] = nenv_d[r];
+    }
+    if (!has_ld_preload) {
+      sprintf(nenv_d[r], "LD_PRELOAD=/%s", DLLNAME);
+      nenv[r] = nenv_d[r];
+      r++;
+    }
+    nenv[r] = "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
     r++;
+    nenv[r] = NULL;
+    execve(chroot_bin, dummy_argv, nenv);
+  } else if (tflag) {
+    if (access(chroot, W_OK | X_OK)) { // dirs need X to be useable
+      fprintf(stderr, "Cant access '%s'\n", chroot);
+      exit(1);
+    }
+    if (access(tarball, R_OK)) {
+      fprintf(stderr, "Cant access '%s'\n", tarball);
+      exit(1);
+    }
+    char *t = realpath(tarball, NULL);
+    const char *args[7];
+    args[0] = "tar";
+    args[1] = "--same-owner";
+    args[2] = "-C";
+    args[3] = TARROOT;
+    args[4] = "-xvf";
+    args[5] = t;
+    args[6] = NULL;
+    ptrace(PT_TRACE_ME, pid, NULL, 0);
+    execvp("tar", args);
   }
-  nenv[r] = "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
-  r++;
-  nenv[r] = NULL;
-  execve(chroot_bin, dummy_argv, nenv);
-}
-else if (tflag) {
-  if (access(chroot, W_OK | X_OK)) { // dirs need X to be useable
-    fprintf(stderr, "Cant access '%s'\n", chroot);
-    exit(1);
-  }
-  if (access(tarball, R_OK)) {
-    fprintf(stderr, "Cant access '%s'\n", tarball);
-    exit(1);
-  }
-  char *t = realpath(tarball, NULL);
-  const char *args[7];
-  args[0] = "tar";
-  args[1] = "--same-owner";
-  args[2] = "-C";
-  args[3] = TARROOT;
-  args[4] = "-xvf";
-  args[5] = t;
-  args[6] = NULL;
-  ptrace(PT_TRACE_ME, pid, NULL, 0);
-  execvp("tar", args);
-}
 }

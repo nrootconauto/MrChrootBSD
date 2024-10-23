@@ -36,7 +36,7 @@ static void HashSync() {
 //Returns static entry on e==NULL
 CHashEntry *HashTableGet(CHashEntry *e,const char *fn_) {
 	char dummyfn[1024];
-	char *fn=DatabasePathForFile(dummyfn,getpid(),fn_);
+	char *fn=DatabasePathForFile(dummyfn,fn_);
 	if(!fn) return NULL;
 	
 	CHashEntry dummy;
@@ -59,7 +59,7 @@ CHashEntry *HashTableGet(CHashEntry *e,const char *fn_) {
 }
 void HashTableSet(const char *fn_,uid_t u,gid_t g,uint32_t perms) {
 	char dummyfn[1024];
-	char *fn=DatabasePathForFile(dummyfn,getpid(),fn_);
+	char *fn=DatabasePathForFile(dummyfn,fn_);
 	if(!fn) return;
 	if(!strcmp(fn,"/")) return ; //No way
 	CHashEntry ent={perms,u,g};
@@ -69,7 +69,7 @@ void HashTableSet(const char *fn_,uid_t u,gid_t g,uint32_t perms) {
 }
 void HashTableRemove(const char *fn_) {
 	char dummyfn[1024];
-	char *fn=DatabasePathForFile(dummyfn,getpid(),fn_);
+	char *fn=DatabasePathForFile(dummyfn,fn_);
 	if(!fn) return;
 	if(!strcmp(fn,"/")) return ; //No way
 	DBT key={fn,strlen(fn)};

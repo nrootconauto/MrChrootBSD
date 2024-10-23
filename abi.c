@@ -38,7 +38,6 @@ void ABISetReturn(pid_t pid, int64_t val, bool failed) {
 void ABISetSyscall(pid_t pid, int64_t num) {
   struct reg regs;
   Getregs(pid, &regs);
-  regs.r_rdx = 0;
   regs.r_rax = num;
   Setregs(pid, &regs);
 }
