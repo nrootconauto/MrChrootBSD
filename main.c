@@ -1,5 +1,6 @@
 #include "abi.h"
 #include "hash.h"
+#include "fd_cache.h"
 #include "mrchroot.h"
 #include "ptrace.h"
 #include <assert.h>
@@ -96,6 +97,7 @@ class (CProcInfo) {
   gid_t groups[NGROUPS_MAX+1];
   uid_t uid,suid,euid; //suid==saved gid,[g/s]etresuid 311/312
   gid_t gid,sgid,egid;
+  CFDCache *fd_cache;
   char *login;
 } proc_head;
 /* clang-format on */
@@ -109,6 +111,8 @@ static void RemoveProc(pid_t pid) {
       next = cur->next;
       next->last = last;
       last->next = next;
+      FDCacheDel(cur->fd_cache);
+      cur->fd_cache=NULL;
       free(cur->login);
       free(cur);
       for (wev = wait_events.next; wev != &wait_events; wev = ev_next) {
@@ -143,19 +147,27 @@ static int64_t UnChrootPath(char *to, char *from) {
   prefix = strlen(best->src_path);
   strcpy(cur, best->src_path);
   StrMove(cur + prefix, from + trim);
-  memcpy(cur, best->src_path, prefix);
+  memmove(cur, best->src_path, prefix);
   if (to)
     strcpy(to, buf);
   return strlen(buf);
 }
 static struct procstat *ps = NULL;
+static CProcInfo *GetProcInfByPid(pid_t pid);
 static int64_t GetProcCwd(char *to);
 static int64_t FdToStr(char *to, int fd) {
   unsigned cnt = 0;
   int64_t res_cnt = 0;
+  if(to) strcpy(to,"");
   char buf[1024];
+  CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
   if (fd == AT_FDCWD) {
     return GetProcCwd(to);
+  }
+  char *have;
+  if(have=FDCacheGet(pinf->fd_cache,fd)) {
+	  if(to) strcpy(to,have);
+	  return strlen(have);
   }
   if (!ps)
     ps = procstat_open_sysctl();
@@ -169,9 +181,10 @@ static int64_t FdToStr(char *to, int fd) {
     if (head) {
       STAILQ_FOREACH(fs, head, next) {
         if (fs->fs_fd == fd && fs->fs_path) {
-          res_cnt = UnChrootPath(buf, fs->fs_path);
-          if (to)
-            strcpy(to, buf);
+            UnChrootPath(buf,fs->fs_path);
+          res_cnt=strlen(buf);
+          FDCacheSet(pinf->fd_cache,fd,buf);
+          if(to ) strcpy(to,buf);
           break;
         }
       }
@@ -230,6 +243,7 @@ static CProcInfo *GetProcInfByPid(pid_t pid) {
                                                  .last = proc_head.last,
                                                  .pid = pid,
                                                  .pid = pid,
+                                                 .fd_cache=FDCacheNew(),
                                                  .ptrace_event_mask = -1};
   return cur->last->next   //
          = cur->next->last //
@@ -824,12 +838,13 @@ static size_t WritePTraceString(void *backup, void *pt_ptr, char const *st) {
 
 static void InterceptRealPathAt() {
   pid_t pid = mc_current_pid;
-  char have_str[1024], chroot[1023];
+  char have_str[1024], chroot[1024],real[1024];
   void *orig_ptr, *to_ptr;
   to_ptr = (void *)GetArg(2);
   size_t blen=GetArg(3); 
   AtSytle(chroot,0,1);
-  UnChrootPath(chroot,chroot);
+  realpath(chroot,real);
+  UnChrootPath(chroot,real);
   PTraceWrite(mc_current_tid,to_ptr,chroot,strlen(chroot)+1);
   SetReturn(0, 0);
 }
@@ -947,7 +962,7 @@ static void InterceptAccess() {
     SetReturn(passed, 1);
   } else {
     // Invalid permsision
-    SetReturn(HasPerms(R_OK, have), 0);
+    SetReturn(-HasPerms(R_OK, what), 0);
   }
 }
 
@@ -1689,8 +1704,12 @@ int main(int argc, const char *argv[], const char **env) {
   }
           InterceptOpen();
         } break;
-        case 6: // close
+        case 6: { // close
+			CProcInfo *pinf=GetProcInfByPid(pid2);
+        	FDCacheRem(pinf->fd_cache,GetArg(0));
+        	ToScx();
           break;
+	  }
         case 7: // wait4
           if (!InterceptWait(GetArg(0), 0)) {
             continue;
@@ -1714,15 +1733,15 @@ int main(int argc, const char *argv[], const char **env) {
           InterceptChdir();
           break;
         }
-        case 13: // fdchdir
+        case 13: // fchdir
 #define FPERMCHECK(af, PATH)                                                   \
   {                                                                            \
     char dst[1024];                                                            \
-    FdToStr(dst, GetArg(0));                                                   \
+    FdToStr(dst, GetArg((int64_t)PATH));                                                   \
     if (0 != HasPerms((af), dst)) {                                            \
       SetSyscall(20); /*  Doesnt do anything*/                                 \
       ToScx();                                                                 \
-      SetReturn(HasPerms((af), dst), 1);                                       \
+      SetReturn(-HasPerms((af), dst), 1);                                       \
       break;                                                                   \
     }                                                                          \
   }
@@ -2344,7 +2363,7 @@ int main(int argc, const char *argv[], const char **env) {
     if (0 != HasPerms((af), full)) {                                           \
       SetSyscall(20); /*  Doesnt do anything*/                                 \
       ToScx();                                                                 \
-      SetReturn(HasPerms((af), dst), 1);                                       \
+      SetReturn(-HasPerms((af), dst), 1);                                       \
       break;                                                                   \
     }                                                                          \
   }
@@ -2544,6 +2563,20 @@ int main(int argc, const char *argv[], const char **env) {
           InterceptRealPathAt();
           break;
         }
+        case 585: { //closerange
+			CProcInfo *pinf=GetProcInfByPid(pid2);
+			int a=GetArg(0);
+			int b=GetArg(1);
+			int f=GetArg(2);
+			if(f&CLOSE_RANGE_CLOEXEC)
+			  ;//Not relevant here
+			else
+			  while(a<b) {
+				  FDCacheRem(pinf->fd_cache,a++);
+			  }
+			ToScx();
+			break;
+		}
         default:;
         }
         goto defacto;

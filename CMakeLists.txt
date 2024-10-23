@@ -5,6 +5,7 @@ add_executable(${PROJECT_NAME}
   main.c
   ptrace.c ptrace.h
   abi.c abi.h
+  fd_cache.c fd_cache.h
   hash.c hash.h)
 add_library(pl_hack SHARED
   preload_hack.c)
