@@ -3,7 +3,7 @@
 
 # NOTICE
 
-  This software is going under major refactors including perimision emulation. Expect something juicy next week. Dont use it for anything serious now(or at all).
+  **This software is going under major refactors including perimision emulation. Expect something juicy next week. Dont use it for anything serious now(or at all).**
 
 
 ## Features
@@ -22,6 +22,8 @@
 This is early in development so stay tuned,use it like a normal chroot. Feel free to probe around the source code and send patches to my github.
 
 ```sh
+git clone https://github.com/nrootconauto/MrChrootBSD.git
+cd MrChrootBSD
 wget https://download.freebsd.org/releases/amd64/14.1-RELEASE/base.txz
 wget https://download.freebsd.org/releases/amd64/14.1-RELEASE/lib32.txz #Needed for gdb for some reason
 mkdir chroot
@@ -31,8 +33,8 @@ tar xvf ../lib32.txz
 cd ..
 cmake .
 make
-cp /etc/resolv.conf /etc # networkring
-./mrhcroot chroot /bin/sh
+cp /etc/resolv.conf /etc # networking
+./mchroot chroot /bin/sh
 # pkg etc
 ``` 
 ## Things to do after chroot'ing

@@ -553,7 +553,7 @@ static void UpdateWaits() {
   CWaitEvent *wev;
   struct ptrace_lwpinfo ptinf;
   struct ptrace_lwpinfo inf;
-  int *write_code_to, who, wflags;
+  int *write_code_to, who, wflags;	
   struct ptrace_sc_remote dummy;
   int64_t args4[4];
   for (cur = proc_head.last; cur != &proc_head; cur = cur->last) {
@@ -612,7 +612,6 @@ static void UpdateWaits() {
         // something went wrong
         cur->flags &= ~PIF_WAITING;
         goto say_got;
-        goto next;
       } else if (dummy.pscr_ret.sr_retval[0] != 0) {
         DiscardWait(cur->pid,
                     dummy.pscr_ret.sr_retval[0]); // EARILER I USED WNOWAIT
@@ -621,7 +620,6 @@ static void UpdateWaits() {
         ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
         goto say_got;
-        goto next;
       }
       // if WNOHANG was set,return as usale
 
@@ -1655,7 +1653,7 @@ int main(int argc, const char *argv[], const char **env) {
         ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         continue;
       } else if (inf.pl_flags & PL_FLAG_SCE) {
-		  //fprintf(stderr,"%d,%d\n",pid2,inf.pl_syscall_code);
+		// fprintf(stderr,"%d,%d\n",pid2,inf.pl_syscall_code);
         switch (inf.pl_syscall_code) {
 
         case MR_CHROOT_NOSYS: {
