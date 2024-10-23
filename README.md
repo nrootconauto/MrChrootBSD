@@ -33,7 +33,7 @@ tar xvf ../lib32.txz
 cd ..
 cmake .
 make
-cp /etc/resolv.conf /etc # networking
+cp /etc/resolv.conf etc # networking
 ./mchroot chroot /bin/sh
 # pkg etc
 ``` 
