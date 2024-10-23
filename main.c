@@ -27,6 +27,9 @@
   typedef struct x x;                                                          \
   struct x
 static int64_t ProcIsAlive(pid_t);
+static char *AtSytle(char *, int64_t, int64_t);
+
+
 static int ptrace2(int a,pid_t p,void *add ,int d) {
 	int r=ptrace(a,p,add,d);
 	//if(r) printf("%d,%d,%d\n",a,p,errno);
@@ -823,11 +826,11 @@ static void InterceptRealPathAt() {
   pid_t pid = mc_current_pid;
   char have_str[1024], chroot[1023];
   void *orig_ptr, *to_ptr;
-  orig_ptr = (void *)GetArg(1);
   to_ptr = (void *)GetArg(2);
-  ReadPTraceString(have_str, orig_ptr);
-  GetChrootedPath(chroot, have_str);
-  ToScx();
+  size_t blen=GetArg(3); 
+  AtSytle(chroot,0,1);
+  UnChrootPath(chroot,chroot);
+  PTraceWrite(mc_current_tid,to_ptr,chroot,strlen(chroot)+1);
   SetReturn(0, 0);
 }
 static void InterceptChown() {
@@ -1344,7 +1347,6 @@ static uid_t FileUid(const char *path) {
   }
   return 0;
 }
-static char *AtSytle(char *, int64_t, int64_t);
 static void InterceptFstat() {
   uid_t dummyu = 0;
   gid_t dummyg = 0;
