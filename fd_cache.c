@@ -5,6 +5,7 @@ CFDCache *FDCacheNew() {
 	r->values=NULL;
 	return r;
 };
+char *fd_cache_none="";
 static size_t RoundUp(int fd) {
 	return (fd&~127)+128*2;
 }
@@ -12,18 +13,23 @@ void FDCacheSet(CFDCache *c,int fd,char *v) {
 	if(fd<=0) return;
 	char **new;
 	if(fd>=c->size) {
-		new=calloc(sizeof(char*),c->size=RoundUp(fd));
+		new=calloc(1,sizeof(char*)*RoundUp(fd));
 		if(c->values) memcpy(new,c->values,sizeof(char*)*c->size);
+		c->size=RoundUp(fd);
 		free(c->values);
 		c->values=new;
 	}
-	if(c->values[fd]) free(c->values[fd]);
-	c->values[fd]=strdup(v);
+	if(FD_CACHE_NOT_FILE!=c->values[fd]) free(c->values[fd]);
+	if(v==FD_CACHE_NOT_FILE) c->values[fd]=FD_CACHE_NOT_FILE;
+	else c->values[fd]=strdup(v);
 }
 void FDCacheRem(CFDCache *c,int fd) {
   if(fd<=0) return;
+  char *have;
   if(fd<c->size) {
-	  free(c->values[fd]);
+	  have=c->values[fd];
+	  if(have!=FD_CACHE_NOT_FILE&&have)
+		free(have);
 	  c->values[fd]=NULL;
   }
 };
@@ -32,7 +38,8 @@ void FDCacheDel(CFDCache *c) {
 	char *have;
 	while(--i>=0) {
 		if(have=c->values[i])
-			free(have);
+		    if(have!=FD_CACHE_NOT_FILE)
+				free(have);
 	}
 	free(c->values);
 	free(c);

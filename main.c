@@ -165,6 +165,10 @@ static int64_t FdToStr(char *to, int fd) {
   }
   char *have;
   if(have=FDCacheGet(pinf->fd_cache,fd)) {
+	  if(have==FD_CACHE_NOT_FILE) {
+	    if(to) strcpy(to,"");
+	    return 0;
+	  }
 	  if(to) strcpy(to,have);
 	  return strlen(have);
   }
@@ -175,6 +179,7 @@ static int64_t FdToStr(char *to, int fd) {
   struct filestat *fs;
   struct kinfo_proc *kprocs =
       procstat_getprocs(ps, KERN_PROC_PID, mc_current_pid, &cnt);
+  FDCacheSet(pinf->fd_cache,fd,FD_CACHE_NOT_FILE);
   for (unsigned i = 0; i < cnt; i++) {
     head = procstat_getfiles(ps, kprocs, 0);
     if (head) {
