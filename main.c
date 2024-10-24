@@ -66,12 +66,17 @@ static void FakeSuccess() {
 }
 #define ptrace ptrace2
 CMountPoint mount_head, *root_mount;
+class (CTidWait) {
+	CTidWait *last,*next;
+	int tid;
+	pid_t pid;
+} waiters;
 class (CWaitEvent) {
 	CWaitEvent *last,*next;
 	int code;
-	pid_t to,from;
+	pid_t from;
 	/* See wait4(2)
-	 * Used wih P_UID/P_GID/P_SID
+	 * Use`d wih P_UID/P_GID/P_SID
 	 */
 	uid_t uid;
 	gid_t gid;
@@ -82,7 +87,6 @@ class (CWaitEvent) {
 #define PIF_PTRACE_FOLLOW_FORK 2
 #define PIF_PTRACE_LWP_EVENTS 4
 #define PIF_TRACE_ME 8 //"chrooted" Debugger wants first dibs on the first SIGTRAP
-#define PIF_TRACE_ME2 16
 #define PIF_EXITED 32 
 #define PIF_TO_SCX_ONLY 64 
 class (CProcInfo) {
@@ -115,11 +119,6 @@ static void RemoveProc(pid_t pid) {
       cur->fd_cache=NULL;
       free(cur->login);
       free(cur);
-      for (wev = wait_events.next; wev != &wait_events; wev = ev_next) {
-        ev_next = wev->next;
-        if (wev->to == pid)
-          RemoveWaitEvent(wev);
-      }
       return;
     }
   }
@@ -269,16 +268,23 @@ static int64_t WaitEventPassesOptions(int what, int options) {
   if (options & WCONTINUED)
     if (WIFCONTINUED(what))
       return 1;
-  if (options & WSTOPPED)
-    if (WIFSTOPPED(what))
-      return 1;
   if (options & WEXITED)
     if (WIFEXITED(what))
       return 1;
-  if (options & WUNTRACED)
     if (WIFSTOPPED(what)) {
+  if (options & WUNTRACED) {
+	  switch(WSTOPSIG(what)) {
+		  case SIGTTIN: case SIGTTOU: case SIGTSTP: case SIGSTOP:
+		  return 1;
+		  default:
+		  return 0;
+		  }
+	 }
       return 1;
     }
+  if (options & WSTOPPED)
+    if (WIFSTOPPED(what))
+      return 1;
   if (WIFSIGNALED(what))
     return 1;
   return 0;
@@ -481,43 +487,51 @@ static void InterceptPtrace() {
   } break;
   }
 }
+static int IsParentProc(pid_t a,pid_t b) {
+	  CProcInfo *cur;
+	  again:;
+	  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
+		  if(!b) return 0;
+		if (b == cur->pid) {
+			if(cur->parent==a)
+			  return 1;
+			b=cur->parent;
+			goto again;
+		}
+  }
+   return 0;
+}
 static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
   CWaitEvent *wev;
+  CProcInfo *pinfw=NULL;
+  CProcInfo *pinfp=NULL	;
   for (wev = wait_events.next; wev != &wait_events; wev = wev->next) {
-    if (wev->to == pid) {
+	  int is_parent=IsParentProc(pid,wev->from);
       if (_idtype == 0) {
-        if (who == -1) { // Any child
+        if (who == -1&&is_parent) { // Any child
           return wev;
-        }
-        if (who == -1) { // Any child with same gpid
-          if (getpgid(wev->from) == getpgid(wev->to))
-            return wev;
         }
         if (who > 0) {
           if (wev->from == who)
             return wev;
         }
         if (who < -1) {
-          if (-wev->from == getpgid(who))
+          if (getpgid(wev->from) == -who)
             return wev;
         }
-      }
-      if (_idtype == P_PID) {
-        if (who == 0) {
-          if (getpgid(who) == getpgid(wev->from))
+        if(who==0&&is_parent) {
             return wev;
-        } else if (wev->from == who)
+		}
+      }	
+      if (_idtype == P_PID) {
+        if (wev->from == who&&is_parent)
           return wev;
       }
       if (_idtype == P_PGID) {
-        if (who == 0) {
-          if (getpgid(who) == getpgid(wev->from))
-            return wev;
-        } else if (getpgid(wev->from) == who)
+        if (getpgid(wev->from) == who&&is_parent)
           return wev;
       }
-      if (_idtype == P_ALL) {
-        if (wev->to == who)
+      if (_idtype == P_ALL&&is_parent) {
           return wev;
       }
       if (_idtype == P_SID) {
@@ -532,7 +546,6 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
         if (wev->uid == who)
           return wev;
       }
-    }
   }
   return NULL;
 }
@@ -550,30 +563,35 @@ static void DiscardWait(pid_t pid, pid_t discard) {
 }
 static void UpdateWaits() {
   CProcInfo *cur, *cur2;
+  CTidWait *waiter,*next_waiter;
   CWaitEvent *wev;
   struct ptrace_lwpinfo ptinf;
   struct ptrace_lwpinfo inf;
   int *write_code_to, who, wflags;	
   struct ptrace_sc_remote dummy;
   int64_t args4[4];
-  for (cur = proc_head.last; cur != &proc_head; cur = cur->last) {
+  int tid;
+  for (waiter = waiters.next; waiter != &waiters; waiter = next_waiter) {
+	  next_waiter=waiter->next;
+	  cur=GetProcInfByPid(waiter->pid);
+	  tid=waiter->tid;
     if (cur->flags & PIF_WAITING) {
-      ptrace(PT_LWPINFO, cur->pid, &inf, sizeof(inf));
+      ptrace(PT_LWPINFO, tid, &inf, sizeof(inf));
       // A safe-place to run PT_SC_REMOTE  is at syscall exit.
       // Keep values before our "dumb" syscall
-      write_code_to = (int *)ABIGetArg(cur->pid, 1);
-      wflags = (int)ABIGetArg(cur->pid, 2);
-      who = (int)ABIGetArg(cur->pid, 0);
+      write_code_to = (int *)ABIGetArg(tid, 1);
+      wflags = (int)ABIGetArg(tid, 2);
+      who = (int)ABIGetArg(tid, 0);
       args4[0] = who;
       args4[1] = (int64_t)write_code_to;
       args4[2] = wflags | WNOHANG | WNOWAIT;
-      args4[3] = ABIGetArg(cur->pid, 3);
+      args4[3] = ABIGetArg(tid, 3);
       if (inf.pl_flags & PL_FLAG_SCE) {
         // run a dummy syscall
-        ABISetSyscall(cur->pid, 20);
-        ptrace(PT_TO_SCX, cur->pid, (caddr_t)1, 0);
+        ABISetSyscall(tid, 20);
+        ptrace(PT_TO_SCX, tid, (caddr_t)1, 0);
         waitpid(cur->pid, NULL, 0);
-        ABISetReturn(cur->pid, 0, 0);
+        ABISetReturn(tid, 0, 0);
       }
     wait4:;
       // Run a dummy WAIT with WNOHANG to check if a signal has come
@@ -581,15 +599,15 @@ static void UpdateWaits() {
       dummy.pscr_args = &args4;
       dummy.pscr_nargs = 4;
       dummy.pscr_syscall = 7;
-      assert(0 == ptrace(PT_SC_REMOTE, cur->pid, &dummy, sizeof(dummy)));
+      assert(0 == ptrace(PT_SC_REMOTE, tid, &dummy, sizeof(dummy)));
       waitpid(cur->pid, NULL, 0);
-      ABISetArg(cur->pid, 0, args4[0]);
-      ABISetArg(cur->pid, 1, args4[1]);
-      ABISetArg(cur->pid, 2, wflags);
-      ABISetArg(cur->pid, 3, args4[3]);
+      ABISetArg(tid, 0, args4[0]);
+      ABISetArg(tid, 1, args4[1]);
+      ABISetArg(tid, 2, wflags);
+      ABISetArg(tid, 3, args4[3]);
       if (wev = EventForWait(cur->pid, who, 0)) {
-        ptrace(PT_WRITE_D, cur->pid, write_code_to, wev->code);
-        ABISetReturn(cur->pid, wev->from, 0);
+        ptrace(PT_WRITE_D, tid, write_code_to, wev->code);
+        ABISetReturn(tid, wev->from, 0);
         RemoveWaitEvent(wev);
         cur->flags &= ~PIF_WAITING;
         goto next;
@@ -598,16 +616,16 @@ static void UpdateWaits() {
         // Syscalls return -errcode on error
         // PT_SC_REMOTE deosnt put error in pscr_ret.sr_retval
         cur->flags &= ~PIF_WAITING;
-        ABISetReturn(cur->pid, -dummy.pscr_ret.sr_error, 1);
+        ABISetReturn(tid, -dummy.pscr_ret.sr_error, 1);
       say_got:
         if (write_code_to) {
-          int code = ptrace(PT_READ_D, cur->pid, write_code_to, 0);
+          int code = ptrace(PT_READ_D, tid, write_code_to, 0);
         }
         goto next;
       }
       // Restore our regs?
       if (dummy.pscr_ret.sr_retval[0] == -1) {
-        ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
+        ABISetReturn(tid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
         // something went wrong
         cur->flags &= ~PIF_WAITING;
@@ -615,9 +633,9 @@ static void UpdateWaits() {
       } else if (dummy.pscr_ret.sr_retval[0] != 0) {
         DiscardWait(cur->pid,
                     dummy.pscr_ret.sr_retval[0]); // EARILER I USED WNOWAIT
-        // Got a valid pid?
+        // Got a valid tid?
         cur->flags &= ~PIF_WAITING;
-        ABISetReturn(cur->pid, dummy.pscr_ret.sr_retval[0],
+        ABISetReturn(tid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
         goto say_got;
       }
@@ -625,21 +643,23 @@ static void UpdateWaits() {
 
       if (wflags & WNOHANG) {
         cur->flags &= ~PIF_WAITING;
-        ABISetReturn(cur->pid, 0, 0);
+        ABISetReturn(tid, 0, 0);
         goto next;
       }
     next:;
       if (!(cur->flags & PIF_WAITING)) {
-        ptrace(PT_TO_SCE, cur->pid, (caddr_t)1, 0);
+		waiter->next->last=waiter->last;
+        waiter->last->next=waiter->next;
+        free(waiter);
+        ptrace(PT_TO_SCE, tid, (caddr_t)1, 0);
       }
     }
   }
 }
-static void DelegatePtraceEvent(pid_t to, pid_t who, int code) {
-  if (to != who) {
+static void DelegatePtraceEvent(pid_t who, int code) {
+  if (who) {
     CWaitEvent *ev = calloc(1, sizeof(CWaitEvent)), *tmp;
     CProcInfo *inf = GetProcInfByPid(who);
-    ev->to = to;
     ev->from = who;
     ev->code = code;
     ev->uid = inf->euid;
@@ -650,13 +670,21 @@ static void DelegatePtraceEvent(pid_t to, pid_t who, int code) {
     ev->next->last = ev;
     ev->last->next = ev;
 
-    //printf("KILL:%d,%d,%d\n", who, WTERMSIG(code), WSTOPSIG(code));
   }
   UpdateWaits();
 }
 // Returns 1 if unpaused,else 0
 static int InterceptWait(int wait_for_type, int wait_for_id) {
   CProcInfo *inf = GetProcInfByPid(mc_current_pid);
+  CTidWait *waiter=calloc(1,sizeof(CTidWait));
+  waiter->tid=mc_current_tid;
+  waiter->pid=mc_current_pid;
+  
+  waiter->next=waiters.next;
+  waiter->last=&waiters;
+  waiter->last->next=waiter;
+  waiter->next->last=waiter;
+  
   inf->flags |= PIF_WAITING;
   UpdateWaits();
   return !!(inf->flags & PIF_WAITING);
@@ -1524,6 +1552,10 @@ int main(int argc, const char *argv[], const char **env) {
   wait_events.last = &wait_events;
   wait_events.next = &wait_events;
 
+  waiters.last = &waiters;
+  waiters.next = &waiters;
+
+
   char *prog = argv[1], *chroot = argv[0];
   char *tarball = argv[0];
 #define TARROOT "/tarextract"
@@ -1570,14 +1602,14 @@ int main(int argc, const char *argv[], const char **env) {
       mc_current_tid = inf.pl_lwpid;
 
       if (WIFEXITED(cond)) {
-        DelegatePtraceEvent(pinf->parent, pid2, cond);
+        DelegatePtraceEvent(pid2, cond);
         pid_t par = pinf->parent;
         pinf->flags |= PIF_EXITED;
         RemoveProc(pid2);
         continue;
       } else if (WIFSIGNALED(cond)) {
         if (1) {
-          DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
+          DelegatePtraceEvent(pid2, cond);
           if (pinf->debugged_by) {
           } else {
             ptrace(PT_CONTINUE, pid2, (void *)1, 0);
@@ -1591,15 +1623,21 @@ int main(int argc, const char *argv[], const char **env) {
       // we are being debugged;
       {
         CProcInfo *pinf2;
-        if (pinf->debugged_by || (pinf->flags & PIF_TRACE_ME)) {
+        if((pinf->flags & PIF_TRACE_ME)) {
+			if(inf.pl_flags&PL_FLAG_EXEC) {
+				pinf->flags&=~PIF_TRACE_ME;
+				goto send_out;
+			}
+	    }
+        if (pinf->debugged_by) {
           pid_t to = pinf->debugged_by;
           if (!to)
-            to = pinf->parent;
+				to = pinf->parent;
           if (pinf->ptrace_event_mask &
               (inf.pl_flags & ~(PL_FLAG_SCE | PL_FLAG_SCX))) {
-          send_out:;
-            DelegatePtraceEvent(to, pid2, cond);
             kill(to, SIGCHLD);
+          send_out:;	
+            DelegatePtraceEvent(pid2, cond);
             // Heres the DEAL.PT_TRACE_ME sets the PTRACE_EXEC flag in the
             // ptrace state(not reset when used)
             UpdateWaits();
@@ -1653,7 +1691,7 @@ int main(int argc, const char *argv[], const char **env) {
         ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         continue;
       } else if (inf.pl_flags & PL_FLAG_SCE) {
-		// fprintf(stderr,"%d,%d\n",pid2,inf.pl_syscall_code);
+		//fprintf(stderr,"%d,%d.\n",pid2,inf.pl_syscall_code);
         switch (inf.pl_syscall_code) {
 
         case MR_CHROOT_NOSYS: {
@@ -1709,14 +1747,12 @@ int main(int argc, const char *argv[], const char **env) {
           break;
 	  }
         case 7: // wait4
-          if (!InterceptWait(GetArg(0), 0)) {
-            continue;
-          }
+          InterceptWait(GetArg(0), 0);
+          continue;
           break;
         case 532: // wait6
-          if (!InterceptWait(GetArg(1), 0)) {
-            continue;
-          }
+          InterceptWait(GetArg(1), 0);
+          continue;
           break;
         case 9: // link
           PERMCHECK(W_OK, 1);
@@ -2586,29 +2622,25 @@ int main(int argc, const char *argv[], const char **env) {
           continue;
         }
         if (!(pinf->flags & PIF_WAITING)) {
-          if (WIFSTOPPED(cond)) {
-            if (WSTOPSIG(cond) != SIGTRAP || pinf->debugged_by) {
-              pid_t debugged_by = pinf->debugged_by;
-              if (!debugged_by) {
-                ptrace(PT_TO_SCE, pid2, (void *)1,
-                       WSTOPSIG(cond)); // !=SIGTAP
-              } else if (debugged_by) {
+          if (WIFSTOPPED(cond)) {	
                 if (WSTOPSIG(cond) == SIGTRAP &&
                     !!(inf.pl_flags & (PL_FLAG_SCE | PL_FLAG_SCX))) {
                   goto ignore;
                 }
-                DelegatePtraceEvent(pinf->debugged_by, pid2, cond);
-                kill(debugged_by, SIGCHLD);
-              }
-              UpdateWaits();
-              continue;
+                DelegatePtraceEvent(pid2, cond);
+                UpdateWaits();
+                if(!pinf->debugged_by)
+					ptrace(PT_TO_SCE,mc_current_tid,(void*)1,WSTOPSIG(cond));
+			    else {
+					kill(pinf->debugged_by,SIGCHLD);
+				}
+                continue;
             }
-          }
+		}
         ignore:;
           ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
         }
-      }
-    }
+	}
   } else if (!tflag) {
     const char *dummy_argv[argc - 2 + 1 + 1];
     int64_t r, has_ld_preload;
