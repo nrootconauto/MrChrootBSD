@@ -1137,7 +1137,7 @@ static void InterceptExecve() {
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
     waitpid(mc_current_tid, NULL, 0);
   } else {
-    char *extra_arg_ptrs[256];
+    char extra_arg_strs[1024][256];
     // fexecve(open("interrepret name"),argv,env)
     command = SkipWhitespace(poop_ant);
     ptr2 = command;
@@ -1150,13 +1150,9 @@ static void InterceptExecve() {
     bulen = WritePTraceString(backup, orig_ptr, chroot);
     ToScx();
     PTraceRestoreBytes(orig_ptr, backup, bulen);
-    // Insert the pointer to the command name before argv(I will dump the
-    // name to NULL,it doesnt matter as we will change the program image at
-    // fexecve)
-    ptr = GetHackDataAreaForPid();
     extra_args = 0;
     WritePTraceString(NULL, ptr, command);
-    extra_arg_ptrs[extra_args++] = ptr;
+    strcpy(extra_arg_strs[extra_args++],command);
     ptr += strlen(command) + 1;
     while (*ptr2) {
       ptr2 = SkipWhitespace(ptr2);
@@ -1164,8 +1160,7 @@ static void InterceptExecve() {
       while (*ptr2 && !isblank((unsigned char)*ptr2))
         ptr2++;
       *ptr2++ = 0;
-      extra_arg_ptrs[extra_args++] = ptr;
-      WritePTraceString(NULL, ptr, argument);
+      strcpy(extra_arg_strs[extra_args++],argument);
       ptr += strlen(argument) + 1;
     }
 
@@ -1176,24 +1171,32 @@ static void InterceptExecve() {
     // argv[...] = ...
 
     // Put command name here
-    WritePTraceString(NULL, ptr, have_str);
-    extra_arg_ptrs[extra_args++] = ptr;
+    strcpy(extra_arg_strs[extra_args++],have_str);
     ptr += strlen(have_str) + 1;
-
-    argv -= extra_args;
-
-    for (fd = 0; fd != extra_args; fd++) {
-      PTraceWritePtr(argv + fd, extra_arg_ptrs[fd]);
-      ReadPTraceString(have_str, extra_arg_ptrs[fd]);
-    }
 
     // The first argument to the argv is the program name,but we delegated
     // it to the interrepter REMOVE THE FIRST ARGUMENT AS IT IS UNECESARY
-    while (PTraceReadPtr(argv + fd)) {
-      PTraceWritePtr(argv + fd, PTraceReadPtr(argv + fd + 1));
+    fd=0;
+    while (PTraceReadPtr(argv + fd+1)) {
+      ReadPTraceString(extra_arg_strs[extra_args++], PTraceReadPtr(argv + fd + 1));
       fd++;
     }
-
+    
+    char *spots[256];
+    ptr=orig_ptr;
+    for (fd = 0; fd != extra_args; fd++) {
+      WritePTraceString(NULL,ptr,extra_arg_strs[fd]);
+      spots[fd]=ptr;
+      ptr+=strlen(extra_arg_strs[fd])+1;
+    }
+    argv=ptr;
+    for (fd = 0; fd != extra_args; fd++) {
+		PTraceWritePtr(ptr,spots[fd]);
+		ptr+=sizeof(char*);
+    }
+	PTraceWritePtr(ptr,NULL);
+	ptr+=sizeof(char*);
+    
     args[0] = GetReturn(NULL);
     args[1] = (int64_t)argv;
     args[2] = (int64_t)env;
