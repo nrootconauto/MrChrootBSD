@@ -493,18 +493,8 @@ static void InterceptPtrace() {
   }
 }
 static int IsParentProc(pid_t a,pid_t b) {
-	  CProcInfo *cur;
-	  again:;
-	  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
-		  if(!b) return 0;
-		if (b == cur->pid) {
-			if(cur->parent==a)
-			  return 1;
-			b=cur->parent;
-			goto again;
-		}
-  }
-   return 0;
+CProcInfo *cur=GetProcInfByPid(b);
+   return cur->parent==a;
 }
 static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
   CWaitEvent *wev;
@@ -525,6 +515,7 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
             return wev;
         }
         if(who==0&&is_parent) {
+          if (getpgid(wev->from) == getpgid(pid))
             return wev;
 		}
       }	
@@ -575,12 +566,13 @@ static void UpdateWaits() {
   int *write_code_to, who, wflags;	
   struct ptrace_sc_remote dummy;
   int64_t args4[4];
-  int tid;
+  int tid,pass;
   for (waiter = waiters.next; waiter != &waiters; waiter = next_waiter) {
 	  next_waiter=waiter->next;
 	  cur=GetProcInfByPid(waiter->pid);
 	  tid=waiter->tid;
-    if (cur->flags & PIF_WAITING) {
+	  pass=0;
+    if (1) {
       ptrace(PT_LWPINFO, tid, &inf, sizeof(inf));
       // A safe-place to run PT_SC_REMOTE  is at syscall exit.
       // Keep values before our "dumb" syscall
@@ -615,12 +607,14 @@ static void UpdateWaits() {
         ABISetReturn(tid, wev->from, 0);
         RemoveWaitEvent(wev);
         cur->flags &= ~PIF_WAITING;
+        pass=1;
         goto next;
       }
       if (dummy.pscr_ret.sr_error != 0) {
         // Syscalls return -errcode on error
         // PT_SC_REMOTE deosnt put error in pscr_ret.sr_retval
         cur->flags &= ~PIF_WAITING;
+        pass=1;
         ABISetReturn(tid, -dummy.pscr_ret.sr_error, 1);
       say_got:
         if (write_code_to) {
@@ -633,6 +627,7 @@ static void UpdateWaits() {
         ABISetReturn(tid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
         // something went wrong
+        pass=1;
         cur->flags &= ~PIF_WAITING;
         goto say_got;
       } else if (dummy.pscr_ret.sr_retval[0] != 0) {
@@ -640,6 +635,7 @@ static void UpdateWaits() {
                     dummy.pscr_ret.sr_retval[0]); // EARILER I USED WNOWAIT
         // Got a valid tid?
         cur->flags &= ~PIF_WAITING;
+        pass=1;
         ABISetReturn(tid, dummy.pscr_ret.sr_retval[0],
                      dummy.pscr_ret.sr_error);
         goto say_got;
@@ -648,11 +644,12 @@ static void UpdateWaits() {
 
       if (wflags & WNOHANG) {
         cur->flags &= ~PIF_WAITING;
+        pass=1;
         ABISetReturn(tid, 0, 0);
         goto next;
       }
     next:;
-      if (!(cur->flags & PIF_WAITING)) {
+      if (pass) {
 		waiter->next->last=waiter->last;
         waiter->last->next=waiter->next;
         free(waiter);
@@ -674,7 +671,6 @@ static void DelegatePtraceEvent(pid_t who, int code) {
     ev->next = &wait_events;
     ev->next->last = ev;
     ev->last->next = ev;
-
   }
   UpdateWaits();
 }
@@ -1135,7 +1131,7 @@ static void InterceptExecve() {
     rmt.pscr_args = args;
     RewriteEnv(env, GetHackDataAreaForPid());
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    waitpid(mc_current_tid, NULL, 0);
+//    waitpid(mc_current_pid, NULL, 0);
   } else {
     char extra_arg_strs[1024][256];
     // fexecve(open("interrepret name"),argv,env)
@@ -1205,7 +1201,7 @@ static void InterceptExecve() {
     rmt.pscr_args = args;
     RewriteEnv(env, ptr);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    waitpid(mc_current_tid, NULL, 0);
+//    waitpid(mc_current_pid, NULL, 0);
   }
   if (perms & S_ISUID) {
     pinf->euid = FileUid(have_str);
@@ -1633,7 +1629,6 @@ int main(int argc, const char *argv[], const char **env) {
         CProcInfo *pinf2;
         if((pinf->flags & PIF_TRACE_ME)) {
 			if(inf.pl_flags&PL_FLAG_EXEC) {
-				pinf->flags&=~PIF_TRACE_ME;
 				goto send_out;
 			}
 	    }
@@ -2635,12 +2630,20 @@ int main(int argc, const char *argv[], const char **env) {
                     !!(inf.pl_flags & (PL_FLAG_SCE | PL_FLAG_SCX))) {
                   goto ignore;
                 }
-                DelegatePtraceEvent(pid2, cond);
-                UpdateWaits();
-                if(!pinf->debugged_by)
+                if(!pinf->debugged_by)  {
+					/* 21 Nroot here,ptrace will stop(?) things even if they would otherwise term
+					 *   SIGINT causes a stop to ptrace then a death after (ptrace )continuing 
+					 *   PL_EVENT_SIGNAL is a (pending) signal incoming 
+					 */
 					ptrace(PT_TO_SCE,mc_current_tid,(void*)1,WSTOPSIG(cond));
-			    else {
+					if(inf.pl_event!=PL_EVENT_SIGNAL /* Pending signal,not handled one*/ ) {
+non_private_stop:
+						DelegatePtraceEvent(pid2, cond);
+						UpdateWaits();
+					}
+			    } else {
 					kill(pinf->debugged_by,SIGCHLD);
+					goto non_private_stop;
 				}
                 continue;
             }

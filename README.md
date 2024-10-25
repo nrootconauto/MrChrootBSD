@@ -56,3 +56,5 @@ I could use help in these areas,I will probably get them done myself but if you 
  1. Add a command line switch to toggle *root user* mode(spoofing)
  2. Add support for `riscv64` and `arm64` in `abi.c`.
  3. Make the tool extremely fun to use(have emojis and stuff)
+ 4. Implement` procctl(3)` reapers.
+ 5. Make sure `wait(2)` actually works(probably does)
