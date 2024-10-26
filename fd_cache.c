@@ -8,9 +8,11 @@ CFDCache *FDCacheNew() {
 char *fd_cache_none="";
 static size_t RoundUp(int fd) {
 	return (fd&~127)+128*2;
+
 }
 void FDCacheSet(CFDCache *c,int fd,char *v) {
 	if(fd<=0) return;
+        if(fd>=1024) return;
 	char **new;
 	if(fd>=c->size) {
 		new=calloc(1,sizeof(char*)*RoundUp(fd));
@@ -47,6 +49,7 @@ void FDCacheDel(CFDCache *c) {
 	
 char *FDCacheGet(CFDCache *c,int fd) {
 	if(fd<=0) return NULL;
+	if(fd>=1024) return NULL;
   if(fd<c->size) {
 	  return c->values[fd];
   }

@@ -45,7 +45,7 @@ cp /etc/resolv.conf chroot/etc # networking
   ```sh
   pkg install doas
   echo 'permit nopass :wheel' > /usr/local/etc/doas.conf
-  adduser
+  adduser -Z
   ```
 ## How it works internally
 It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
@@ -58,3 +58,5 @@ I could use help in these areas,I will probably get them done myself but if you 
  3. Make the tool extremely fun to use(have emojis and stuff)
  4. Implement` procctl(3)` reapers.
  5. Make sure `wait(2)` actually works(probably does)
+ 6. Validate existing `sysctl(3)` stuff.
+ 7. Make `fstat` and its freinds use `perms.db`.

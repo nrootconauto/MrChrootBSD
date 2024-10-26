@@ -19,7 +19,7 @@ static uint32_t HashStr(const void *f,size_t sz) {
 static 	DB *perms_db=NULL;
 void HashTableInit(const char *name) {
 	HASHINFO hi;
-	hi.bsize=2048*sizeof(void*);
+	hi.bsize=2048*2;
 	hi.ffactor=8;
 	hi.nelem=1;
 	hi.cachesize=1024;
