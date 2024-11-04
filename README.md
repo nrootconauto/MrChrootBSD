@@ -11,12 +11,12 @@
 - Do chroot in userspace
 - Partial `ptrace` emulation(limited,you can run `gdb` in your MrChroot's sort of and it will make you happy maybe)
 - (Currently) buggy user permisions database(`perms.db` using `db(3)`)
+
 ## Non-Features
   Some of these will be removed(added to features) in the future
 - Full `ptrace` emulation(Dont rely on `PT_TO_SCE`/`PT_TO_SCX` to work).
 - jails
 - daemons
-- sysctl
 
 ## Usage
 This is early in development so stay tuned,use it like a normal chroot. Feel free to probe around the source code and send patches to my github.
@@ -27,13 +27,12 @@ cd MrChrootBSD
 wget https://download.freebsd.org/releases/amd64/14.1-RELEASE/base.txz
 wget https://download.freebsd.org/releases/amd64/14.1-RELEASE/lib32.txz #Needed for gdb for some reason
 mkdir chroot
-cd chroot 
-tar xvf ../base.txz
-tar xvf ../lib32.txz
 cd ..
 cmake .
 make
 cp /etc/resolv.conf chroot/etc # networking
+./mchroot -t base.txz chroot # Accounts for perms.db database
+./mchroot -t lib32.txz chroot # Accounts for perms.db database
 ./mchroot chroot /bin/sh
 # pkg etc
 ``` 
@@ -47,16 +46,16 @@ cp /etc/resolv.conf chroot/etc # networking
   echo 'permit nopass :wheel' > /usr/local/etc/doas.conf
   adduser -Z
   ```
+  **MAKE SURE TO USE -Z with adduser TO NOT MAKE A ZFS dataset.**
 ## How it works internally
 It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
 
 ## Development Please ;)
 I could use help in these areas,I will probably get them done myself but if you want to make my day:
 
- 1. Add a command line switch to toggle *root user* mode(spoofing)
- 2. Add support for `riscv64` and `arm64` in `abi.c`.
- 3. Make the tool extremely fun to use(have emojis and stuff)
- 4. Implement` procctl(3)` reapers.
- 5. Make sure `wait(2)` actually works(probably does)
- 6. Validate existing `sysctl(3)` stuff.
- 7. Make `fstat` and its freinds use `perms.db`.
+ 1. Add support for `riscv64` and `arm64` in `abi.c`.
+ 2. Make the tool extremely fun to use(have emojis and stuff)
+ 3. Implement` procctl(3)` reapers.
+ 4. Make sure `wait(2)` actually works(probably does)
+ 5. Validate existing `sysctl(3)` stuff(Probably works).
+ 6. **MAKE A ROBUST WAY TO TEST OF A PATH IS CHROOTED/UNCHROOTED**(like make the paths start with '\01' or '\02')

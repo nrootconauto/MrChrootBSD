@@ -28,45 +28,7 @@
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
-static int64_t ProcIsAlive(pid_t);
-static char *AtSytle(char *, int64_t, int64_t);
 
-
-
-static int ptrace2(int a,pid_t p,void *add ,int d) {
-	int r=ptrace(a,p,add,d);
-	//if(r) printf("%d,%d,%d\n",a,p,errno);
-	return r;
-}
-#define assert(f) if(!(f)) {fprintf(stderr,"Failure at " __FILE__  "(%d). Your on your own!!!\n",__LINE__); abort();}
-static pid_t mc_current_pid;
-static int mc_current_tid; //LWP id
-static void ToScx() {
-	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
-	waitpid(mc_current_pid,NULL,0);
-}
-static void SetArg(int64_t a,int64_t v) {
-	ABISetArg(mc_current_tid,a,v);
-}
-static int64_t GetArg(int64_t a) {
-	return ABIGetArg(mc_current_tid,a);
-}
-static void SetReturn(int64_t e,int64_t fu) {
-	ABISetReturn(mc_current_tid,e,fu);
-}
-static void SetSyscall(int64_t sc) {
-	ABISetSyscall(mc_current_tid,sc);
-}
-static int64_t GetReturn(char *fail) {
-	return ABIGetReturn(mc_current_tid,fail);
-}
-
-// Fakes a succeffusl return
-static void FakeSuccess() {
-	ToScx();
-  SetReturn(0, 0);
-}
-#define ptrace ptrace2
 CMountPoint mount_head, *root_mount;
 class (CTidWait) {
 	CTidWait *last,*next;
@@ -106,7 +68,91 @@ class (CProcInfo) {
   gid_t gid,sgid,egid;
   CFDCache *fd_cache;
   char *login;
+  /* Sometimes we catch a kill(2) signal during a syscall. If we get such a thing,
+   * be sure to delegate our kill next time we use PT_CONTINUE(and freinds like PT_TO_SCX)
+   * 
+   * I made a function called NextKillSig(),use it
+   *    - 21 Nroot
+  */
+  int kill_with_signal;
 } proc_head;
+static int64_t ProcIsAlive(pid_t);
+static char *AtSytle(char *, int64_t, int64_t);
+static void DelegatePtraceEvent(pid_t who, int code);
+static CProcInfo *GetProcInfByPid(pid_t pid);
+static int64_t GetProcCwd(char *to);
+static void RemoveProc(pid_t pid);
+static int NextKillSig(pid_t pid) {
+	CProcInfo *p=GetProcInfByPid(pid);
+	int ret=0;
+	if(p) {
+		ret=p->kill_with_signal;
+		p->kill_with_signal=0;
+	}
+	return ret;
+}
+
+static int ptrace2(int a,pid_t p,void *add ,int d) {
+	int r=ptrace(a,p,add,d);
+	//if(r) printf("%d,%d,%d\n",a,p,errno);
+	return r;
+}
+
+#define assert(f) if(!(f)) {fprintf(stderr,"Failure at " __FILE__  "(%d). Your on your own!!!\n",__LINE__); abort();}
+static pid_t mc_current_pid;
+static int mc_current_tid; //LWP id
+static int WaitForPid(pid_t pid) {
+	int cond=0;
+	int sig=0;
+	if(pid==waitpid(pid, &cond,
+                           WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
+                               WCONTINUED)) {
+		if(WIFEXITED(cond)) {
+			DelegatePtraceEvent(pid,cond);
+			ptrace(pid,PT_CONTINUE,(caddr_t)1,0);
+			RemoveProc(pid);
+		} else if(WIFSIGNALED(cond)) {
+			DelegatePtraceEvent(pid,cond);
+			sig=WTERMSIG(cond);
+		} else if(WIFCONTINUED(cond)) {
+			DelegatePtraceEvent(pid,cond);
+		} else if(WIFSTOPPED(cond)) {
+			sig=WSTOPSIG(cond);
+		}
+		if(WIFSTOPPED(cond)&&sig==SIGTRAP)
+			/* For Ptrace(MrChrootBSD?)*/
+		  sig=0;
+		GetProcInfByPid(pid)->kill_with_signal=sig;
+		return sig;
+	}
+	return -1;
+} 
+static void ToScx() {
+	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
+	WaitForPid(mc_current_pid);
+}
+static void SetArg(int64_t a,int64_t v) {
+	ABISetArg(mc_current_tid,a,v);
+}
+static int64_t GetArg(int64_t a) {
+	return ABIGetArg(mc_current_tid,a);
+}
+static void SetReturn(int64_t e,int64_t fu) {
+	ABISetReturn(mc_current_tid,e,fu);
+}
+static void SetSyscall(int64_t sc) {
+	ABISetSyscall(mc_current_tid,sc);
+}
+static int64_t GetReturn(char *fail) {
+	return ABIGetReturn(mc_current_tid,fail);
+}
+
+// Fakes a succeffusl return
+static void FakeSuccess() {
+	ToScx();
+  SetReturn(0, 0);
+}
+#define ptrace ptrace2
 static long GetKInfoProc(struct kinfo_proc *ret,pid_t p,bool inc_threads) {
 	int dummy_name[4];
 	size_t r=0;
@@ -126,23 +172,7 @@ static long GetKInfoProc(struct kinfo_proc *ret,pid_t p,bool inc_threads) {
 }
 /* clang-format on */
 static void RemoveWaitEvent(CWaitEvent *);
-static void RemoveProc(pid_t pid) {
-  CProcInfo *cur, *next, *last;
-  CWaitEvent *wev, *ev_next;
-  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
-    if (pid == cur->pid) {
-      last = cur->last;
-      next = cur->next;
-      next->last = last;
-      last->next = next;
-      FDCacheDel(cur->fd_cache);
-      cur->fd_cache = NULL;
-      free(cur->login);
-      free(cur);
-      return;
-    }
-  }
-}
+
 static char *StrMove(char *to, char *from) {
   int64_t len = strlen(from) + 1;
   return memmove(to, from, len);
@@ -172,8 +202,6 @@ static int64_t UnChrootPath(char *to, char *from) {
   return strlen(buf);
 }
 static struct procstat *ps = NULL;
-static CProcInfo *GetProcInfByPid(pid_t pid);
-static int64_t GetProcCwd(char *to);
 static int64_t FdToStr(char *to, int fd) {
   unsigned cnt = 0;
   int64_t res_cnt = 0;
@@ -261,11 +289,39 @@ static void PTraceWriteBytes(void *pt_ptr, const void *st, size_t len) {
 
 #define declval(T) (*(T *)0ul)
 #define Startswith(s, what) (!memcmp((s), (what), strlen(what)))
+static CProcInfo *cache_inf=NULL;
+static pid_t cache_pid=-1;
+static void RemoveProc(pid_t pid) {
+  CProcInfo *cur, *next, *last;
+  CWaitEvent *wev, *ev_next;
+  cache_pid=-1;
+  cache_inf=NULL;
+  for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
+    if (pid == cur->pid) {
+      last = cur->last;
+      next = cur->next;
+      next->last = last;
+      last->next = next;
+      FDCacheDel(cur->fd_cache);
+      cur->fd_cache = NULL;
+      free(cur->login);
+      free(cur);
+      return;
+    }
+  }
+}
+
 static CProcInfo *GetProcInfByPid(pid_t pid) {
   CProcInfo *cur;
+  if(cache_pid==pid) {
+	  return cache_inf;
+  }
   for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
-    if (pid == cur->pid)
-      return cur;
+    if (pid == cur->pid) {
+		cache_inf=cur;
+		cache_pid=pid;
+      return cache_inf;
+    }
   }
   *(cur = calloc(sizeof(*cur), 1)) = (CProcInfo){.next = &proc_head,
                                                  .last = proc_head.last,
@@ -273,6 +329,8 @@ static CProcInfo *GetProcInfByPid(pid_t pid) {
                                                  .pid = pid,
                                                  .fd_cache = FDCacheNew(),
                                                  .ptrace_event_mask = -1};
+  cache_inf=cur;
+  cache_pid=pid;
   return cur->last->next   //
          = cur->next->last //
          = cur;
@@ -581,7 +639,7 @@ static void DiscardWait(pid_t pid, pid_t discard) {
   dummy.pscr_nargs = 4;
   dummy.pscr_syscall = 7;
   assert(0 == ptrace(PT_SC_REMOTE, pid, &dummy, sizeof(dummy)));
-  waitpid(pid, NULL, 0);
+  WaitForPid(pid);
   SetReturn(oldr, failed);
 }
 static void UpdateWaits() {
@@ -613,8 +671,8 @@ static void UpdateWaits() {
       if (inf.pl_flags & PL_FLAG_SCE) {
         // run a dummy syscall
         ABISetSyscall(tid, 20);
-        ptrace(PT_TO_SCX, tid, (caddr_t)1, 0);
-        waitpid(cur->pid, NULL, 0);
+        ptrace(PT_TO_SCX,cur->pid,(caddr_t)1,NextKillSig(cur->pid));
+        WaitForPid(cur->pid);
         ABISetReturn(tid, 0, 0);
       }
     wait4:;
@@ -623,8 +681,8 @@ static void UpdateWaits() {
       dummy.pscr_args = &args4;
       dummy.pscr_nargs = 4;
       dummy.pscr_syscall = 7;
-      assert(0 == ptrace(PT_SC_REMOTE, tid, &dummy, sizeof(dummy)));
-      waitpid(cur->pid, NULL, 0);
+      assert(0 == ptrace(PT_SC_REMOTE, cur->pid, &dummy, sizeof(dummy)));
+      WaitForPid(cur->pid);
       ABISetArg(tid, 0, args4[0]);
       ABISetArg(tid, 1, args4[1]);
       ABISetArg(tid, 2, wflags);
@@ -678,7 +736,7 @@ static void UpdateWaits() {
         waiter->next->last = waiter->last;
         waiter->last->next = waiter->next;
         free(waiter);
-        ptrace(PT_TO_SCE, tid, (caddr_t)1, 0);
+        ptrace(PT_TO_SCE, tid, (caddr_t)1, NextKillSig(cur->pid));
       }
     }
   }
@@ -991,6 +1049,9 @@ static int HasPerms(int af, char *path_) {
     masked = e->perms & 0b111;
     if (masked & what)
       return 0;
+    if(inf->euid==0)
+    /* root?*/
+		return 0;
     return -EACCES;
   }
   return 0; //???
@@ -1559,7 +1620,7 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
     SetArg(4, (int64_t)_new);
     SetArg(5, _new_sz);
     ToScx();
-    return;
+	return;
   }
   int *name = calloc(sizeof(int), nlen);
   PTraceRead(mc_current_tid, name, _name, nlen * sizeof(int));
@@ -1572,9 +1633,9 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
   case CTL_KERN:
     if (nlen >= 3) {
       if (name[1] == KERN_PROC) {
-        if (nlen == 3 && name[2] == KERN_PROC_ALL)
+        if (nlen == 3 && (name[2] == KERN_PROC_ALL||name[2]==KERN_PROC_PROC))
           ; // All is good
-        if (nlen < 4)
+        else if (nlen < 4)
           break;
         switch (name[2] & ~KERN_PROC_INC_THREAD) {
         case KERN_PROC_FILEDESC:
@@ -1672,9 +1733,10 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
         case KERN_PROC_PGRP:
 #define KERN_PROC_PRED(predicate)                                              \
   for(cur=head->next;cur != head;cur=cur->next){                                                        \
-    if (predicate)                                                             \
+    if (predicate) {                                                             \
       ret_ln +=                                                                \
           GetKInfoProc(NULL, cur->pid, !!(name[2] & KERN_PROC_INC_THREAD));    \
+	  } \
   }                                                                            \
   ret_procs = calloc(1, ret_ln);                                               \
   ret_ln = 0;                                                                  \
@@ -1716,7 +1778,7 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
           /* 21 Nroot
            *  See kern_proc.c in FreeBSD src code
            */
-          KERN_PROC_PRED(cur->pid == mc_current_pid);
+          KERN_PROC_PRED(1);
           break;
         dump_procs:
           if (!ret) {
@@ -1741,7 +1803,34 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
   free(name);
   goto defacto;
 }
-
+static void InterceptSysctlByname() {
+	char name[1024];
+	size_t len=0;
+	void *write_to=(char*)GetArg(0);
+	int *have=NULL,*backup=NULL;
+	PTraceRead(mc_current_tid,name,write_to,GetArg(1));
+	name[GetArg(1)]=0;
+	if(sysctlnametomib(name,NULL,&len)) {
+fail:;
+		if(have) free(have);
+		if(backup) free(backup);
+		SetSyscall(20);
+		ToScx();
+		SetReturn(-errno,1);
+		return;
+	}
+	have=calloc(sizeof(int),len);
+	backup=calloc(sizeof(int),len);
+	if(sysctlnametomib(name,have,&len))
+		goto fail;
+   PTraceRead(mc_current_tid,backup,write_to,sizeof(int)*len);
+   PTraceWrite(mc_current_tid,write_to,have,sizeof(int)*len);
+   SetSyscall(202); // "Normal" sysctl
+   InterceptSysctl0(write_to,len,(void*)GetArg(2),(void*)GetArg(3),(void*)GetArg(4),GetArg(5));
+   PTraceWrite(mc_current_tid,write_to,backup,sizeof(int)*len);
+   free(backup);
+   free(have);
+}
 int main(int argc, const char *argv[], const char **env) {
   signal(SIGHUP, SIG_IGN);
   pid_t pid, pid2;
@@ -1751,13 +1840,14 @@ int main(int argc, const char *argv[], const char **env) {
   char hflag = 0;
   char tflag = 0;
   if (argc < 3) {
-  help:
+  help:;
+    const char *me=argc > 0 ? argv[0] : "mrchroot";
     fprintf(stderr,
             "Usage %s [chroot] [shell] ...\n"
             "  %s -t [base.tar] [chroot]\n"
             "	-h	Display this help message\n"
             "	-t	Extract a tar with valid permisons into [chroot]\n",
-            argc > 0 ? argv[0] : "mrchroot");
+            me,me);
     return 1;
   }
   while ((ch = getopt(argc, argv, "th")) != -1) {
@@ -1818,7 +1908,7 @@ int main(int argc, const char *argv[], const char **env) {
     while ((pid2 = waitpid(-1, &cond,
                            WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
                                WCONTINUED))) {
-      if (WIFEXITED(cond) && pid2 == pid) {
+      if ((WIFSIGNALED(cond)||WIFEXITED(cond)) && pid2 == pid) {
         HashTableDone();
         exit(0);
       }
@@ -1844,7 +1934,7 @@ int main(int argc, const char *argv[], const char **env) {
           DelegatePtraceEvent(pid2, cond);
           if (pinf->debugged_by) {
           } else {
-            ptrace(PT_CONTINUE, pid2, (void *)1, 0);
+            ptrace(PT_CONTINUE, pid2, (void *)1, WTERMSIG(cond));
             RemoveProc(pid2);
           }
           UpdateWaits();
@@ -1880,7 +1970,7 @@ int main(int argc, const char *argv[], const char **env) {
       if (inf.pl_flags & PL_FLAG_EXITED) {
         UpdateWaits();
         // DelegatePtraceEvent
-        ptrace(PT_TO_SCE, pid2, (void *)1, 0);
+        ptrace(PT_TO_SCE, pid2, (void *)1, 0); /* We exited so no need for signal 21 */
         continue;
       }
       if (inf.pl_flags & PL_FLAG_EXITED) {
@@ -1891,7 +1981,7 @@ int main(int argc, const char *argv[], const char **env) {
         pinf->flags &= ~PIF_EXITED;
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
         ptrace(PT_LWP_EVENTS, mc_current_tid, NULL, 1);
-        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, NextKillSig(mc_current_pid));
         continue;
       } else if (inf.pl_flags &
                  (PL_FLAG_FORKED | PL_FLAG_VFORKED | PL_FLAG_VFORK_DONE)) {
@@ -1916,12 +2006,12 @@ int main(int argc, const char *argv[], const char **env) {
         memcpy(child->groups, parent->groups, child->ngrps * sizeof(gid_t));
         // Born again?
         parent->flags &= ~PIF_EXITED;
-        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, NextKillSig(mc_current_pid));
         continue;
       } else if (inf.pl_flags & PL_FLAG_CHILD) {
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
         ptrace(PT_LWP_EVENTS, mc_current_tid, (void *)1, 0);
-        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, NextKillSig(mc_current_pid));
         continue;
       } else if (inf.pl_flags & PL_FLAG_SCE) {
         // fprintf(stderr,"%d,%d.\n",pid2,inf.pl_syscall_code);
@@ -2074,7 +2164,7 @@ int main(int argc, const char *argv[], const char **env) {
                      cur->euid == me->euid) || // cur->euid
                     (poo == SIGCONT && (getsid(want) == getsid(pid2)))) {
                   ToScx();
-                  int e = kill(want, poo);
+                  int e = kill(want, poo);	
                   if (e)
                     SetReturn(e, 1);
                   else {
@@ -2085,6 +2175,7 @@ int main(int argc, const char *argv[], const char **env) {
                   // Not permiteed 2 kill
                   ToScx();
                   SetReturn(-EPERM, 1);
+                  break;
                 }
               }
             }
@@ -2630,8 +2721,10 @@ int main(int argc, const char *argv[], const char **env) {
       strcat(full, "/");                                                       \
       strcat(full, dst);                                                       \
     }                                                                          \
-    if (write_to)                                                              \
+    if (write_to)            {                                                  \
       strcpy((write_to), full);                                                \
+      UnChrootPath((write_to),(write_to)); \
+    } \
     if (0 != HasPerms((af), full)) {                                           \
       SetSyscall(20); /*  Doesnt do anything*/                                 \
       ToScx();                                                                 \
@@ -2659,6 +2752,7 @@ int main(int argc, const char *argv[], const char **env) {
           FATPERMCHECK(use, W_OK | F_OK, 0, 1);
           CProcInfo *inf = GetProcInfByPid(pid2);
           AtSytle(use, 0, 1);
+          UnChrootPath(use,use);
           GetReturn(&failed);
           if (!failed) {
             HashTableSet(use, GetArg(2), GetArg(3), FilePerms(use));
@@ -2743,6 +2837,7 @@ int main(int argc, const char *argv[], const char **env) {
           char del[1024];
           FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
           AtSytle(del, 0, 1);
+          UnChrootPath(del,del);
           HashTableRemove(del);
         } break;
         case 506 ... 508: // jail stuff TODO
@@ -2819,6 +2914,9 @@ int main(int argc, const char *argv[], const char **env) {
           FATPERMCHECK(NULL, W_OK | F_OK, 1, 2);
           AtSytle(NULL, 1, 2);
         } break;
+        case 570:
+          InterceptSysctlByname();
+          break;
         case 572: // shm_rename
           InterceptShmRename();
           break;
@@ -2830,7 +2928,7 @@ int main(int argc, const char *argv[], const char **env) {
           InterceptRealPathAt();
           break;
         }
-        case 585: { // closerange
+        case 785: { // closerange
           CProcInfo *pinf = GetProcInfByPid(pid2);
           int a = GetArg(0);
           int b = GetArg(1);
@@ -2851,7 +2949,7 @@ int main(int argc, const char *argv[], const char **env) {
       defacto:
         if (pinf->flags & PIF_TO_SCX_ONLY) {
           pinf->flags &= ~PIF_TO_SCX_ONLY;
-          ptrace(PT_TO_SCX, pid2, (caddr_t)1, 0);
+          ptrace(PT_TO_SCX, pid2, (caddr_t)1, NextKillSig(pid2));
           continue;
         }
         if (!(pinf->flags & PIF_WAITING)) {
@@ -2881,7 +2979,7 @@ int main(int argc, const char *argv[], const char **env) {
           }
         }
       ignore:;
-        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, 0);
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1, NextKillSig(mc_current_pid));
       }
     }
   } else if (!tflag) {
