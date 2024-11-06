@@ -11,6 +11,7 @@
 - Do chroot in userspace
 - Partial `ptrace` emulation(limited,you can run `gdb` in your MrChroot's sort of and it will make you happy maybe)
 - (Currently) buggy user permisions database(`perms.db` using `db(3)`)
+- X11 within MrChrootBSD easily with the `-X` option.
 
 ## Non-Features
   Some of these will be removed(added to features) in the future
@@ -36,6 +37,11 @@ cp /etc/resolv.conf chroot/etc # networking
 ./mchroot chroot /bin/sh
 # pkg etc
 ``` 
+
+### X11 within MrChrootBSD
+
+  Use `-X` option to allow /var/run and XAUTHORITY to be set so you can run X11 apps.
+
 ## Things to do after chroot'ing
 ### Copy `/etc/resolv.conf` into `/etc`.
   You'll want to do this for networking
@@ -48,7 +54,8 @@ cp /etc/resolv.conf chroot/etc # networking
   ```
   **MAKE SURE TO USE -Z with adduser TO NOT MAKE A ZFS dataset.**
 ## How it works internally
-It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
+
+  It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
 
 ## Development Please ;)
 I could use help in these areas,I will probably get them done myself but if you want to make my day:

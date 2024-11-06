@@ -25,6 +25,8 @@
 #include <sys/sysctl.h>
 #include <sys/user.h>
 #include <libprocstat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
@@ -1949,13 +1951,14 @@ int main(int argc, const char *argv[], const char **env) {
             "  %s -t [base.tar] [chroot]\n"
             "	-h	Display this help message\n"
             "	-t	Extract a tar with valid permisons into [chroot]\n"
-            "	-X	Enable X11 stuff(see source code)\n",me, me);
+            "	-X	Enable X11 stuff(see source code)\n",
+            me, me);
     return 1;
   }
   while ((ch = getopt(argc, argv, "thX")) != -1) {
     if (ch == 'h') {
       hflag = 1;
-    }else if (ch == 'X') {
+    } else if (ch == 'X') {
       Xflag = 1;
     } else if (ch == 't') {
       tflag = 1;
@@ -1998,6 +2001,8 @@ int main(int argc, const char *argv[], const char **env) {
     AddMountPoint("/dev", "/dev");
     if (Xflag) {
       AddMountPoint("/var/run", "/var/run");
+      AddMountPoint("/proc", "/proc");
+      AddMountPoint("/tmp", "/tmp"); // Needed for /tmp/.X11-ubix/Xx
     }
   }
 
@@ -2968,6 +2973,70 @@ int main(int argc, const char *argv[], const char **env) {
         case 524: // setloginclass
           FakeSuccess();
           break;
+        case 98:    // connect
+        case 104: { // bind
+          char c[1024], bu[1024];
+          void *want = (void *)GetArg(1);
+          size_t gyatt = GetArg(2);
+          struct sockaddr_un *sa_un;
+          if (want) {
+            sa_un = calloc(1, gyatt + 4);
+            PTraceRead(mc_current_tid, sa_un, want, gyatt);
+            SetEnding(sa_un->sun_path, MC_UNCHROOTED_ENDING);
+            if (sa_un->sun_family == AF_LOCAL) {
+              StrCpyWithEnding(c, C(sa_un->sun_path));
+              free(sa_un);
+              gyatt = offsetof(struct sockaddr_un, sun_path) + strlen(c) + 1;
+              sa_un = calloc(1, gyatt);
+              sa_un->sun_len = gyatt;
+              sa_un->sun_family = AF_LOCAL;
+              strcpy(sa_un->sun_path, c);
+              PTraceRead(mc_current_tid, bu, want, gyatt);
+              PTraceWriteBytes(want, sa_un, gyatt);
+              SetArg(2, gyatt);
+              ToScx();
+              PTraceWriteBytes(want, bu, gyatt);
+              free(sa_un);
+              break;
+            }
+            free(sa_un);
+          }
+          break;
+        }
+        case 539:   // connectat
+        case 538: { // bindat
+          char c[1024], bu[1024], fdp[1024];
+          void *want = (void *)GetArg(2);
+          size_t gyatt = GetArg(3);
+          struct sockaddr_un *sa_un;
+          if (want) {
+            sa_un = calloc(1, gyatt + 4);
+            PTraceRead(mc_current_tid, sa_un, want, gyatt);
+            SetEnding(sa_un->sun_path, MC_UNCHROOTED_ENDING);
+            if (sa_un->sun_family == AF_LOCAL) {
+              StrCpyWithEnding(c, sa_un->sun_path);
+              free(sa_un);
+              if (c[0] == '/') {
+              } else {
+                FdToStr(fdp, GetArg(0));
+                sprintf(c, "%s/%s", fdp, c);
+                SetEnding(c, MC_UNCHROOTED_ENDING);
+              }
+              StrCpyWithEnding(c, C(c));
+              gyatt = offsetof(struct sockaddr_un, sun_path) + strlen(c) + 1;
+              sa_un = calloc(1, gyatt);
+              sa_un->sun_len = gyatt;
+              sa_un->sun_family = AF_LOCAL;
+              strcpy(sa_un->sun_path, c);
+              PTraceRead(mc_current_tid, bu, want, gyatt);
+              PTraceWriteBytes(want, sa_un, gyatt);
+              SetArg(3, gyatt);
+            }
+            ToScx();
+            free(sa_un);
+          }
+          break;
+        }
         case 544: { // procctl
           idtype_t idt = GetArg(0);
           long id = GetArg(1);
@@ -3138,7 +3207,7 @@ int main(int argc, const char *argv[], const char **env) {
     char nenv_d[256][1024];
     char *nenv[256], *xauth = NULL;
     has_ld_preload = 0;
-    r=0;
+    r = 0;
     for (int r2 = 0; env[r2]; r2++) {
       if (Startswith(env[r2], "XAUTHORITY=") && Xflag)
         continue;
@@ -3156,23 +3225,23 @@ int main(int argc, const char *argv[], const char **env) {
       r++;
     }
     if (Xflag) {
-		#define XAUTH_NAME ".XAuthority"
+#define XAUTH_NAME ".XAuthority"
       if (xauth = getenv("XAUTHORITY")) {
-		  sprintf(nenv_d[r],"XAUTHORITY=/"XAUTH_NAME);
-		  nenv[r]=nenv_d[r];
-		  r++;
-		  int f,f2;
-		  if((f = open(xauth, O_RDONLY))>=0) {
-			  f2 = open(XAUTH_NAME,O_WRONLY | O_CREAT, 0644);
-			  if(f2>=0) {
-				  copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
-				  close(f2);
-			  }
-			  close(f);
-		  }
+        sprintf(nenv_d[r], "XAUTHORITY=/" XAUTH_NAME);
+        nenv[r] = nenv_d[r];
+        r++;
+        int f, f2;
+        if ((f = open(xauth, O_RDONLY)) >= 0) {
+          f2 = open(XAUTH_NAME, O_WRONLY | O_CREAT, 0644);
+          if (f2 >= 0) {
+            copy_file_range(f, NULL, f2, NULL, SSIZE_MAX, 0);
+            close(f2);
+          }
+          close(f);
+        }
       }
     }
-    
+
     nenv[r] = "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib";
     r++;
     nenv[r] = NULL;
