@@ -59,7 +59,6 @@ class (CWaitEvent) {
 #define PIF_TRACE_ME 8 //"chrooted" Debugger wants first dibs on the first SIGTRAP
 #define PIF_EXITED 32 
 #define PIF_TO_SCX_ONLY 64 
-#define PIF_NO_MORE 128
 /*
  * 21 Nroot here
  * I will end Chrooted strings with "\00\01\02\00"
@@ -196,7 +195,6 @@ static void OnSyscallExitSetBackup2(COnSyscallExit *e,const char *to,char *a,int
  
 static COnSyscallExit *FinishFail(int64_t code) {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	assert(!(pinf->flags&PIF_NO_MORE));
 	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=1;
@@ -204,12 +202,10 @@ static COnSyscallExit *FinishFail(int64_t code) {
 	sce->tid=mc_current_tid;
 	sce->next=pinf->sc_on_exit;
 	pinf->sc_on_exit=sce;
-	pinf->flags|=PIF_NO_MORE;
 	return sce;
 }
 static COnSyscallExit *FinishPass1(int64_t code) {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	assert(!(pinf->flags&PIF_NO_MORE));
 	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=0;
@@ -219,12 +215,10 @@ static COnSyscallExit *FinishPass1(int64_t code) {
 	sce->next=pinf->sc_on_exit;
 	pinf->sc_on_exit=sce;
 
-	pinf->flags|=PIF_NO_MORE;
 	return sce;
 }
 static COnSyscallExit *FinishPass0() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	assert(!(pinf->flags&PIF_NO_MORE));
 	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=0;
@@ -234,12 +228,10 @@ static COnSyscallExit *FinishPass0() {
 	sce->next=pinf->sc_on_exit;
 	pinf->sc_on_exit=sce;
 
-	pinf->flags|=PIF_NO_MORE;
 	return sce;
 }
 static  COnSyscallExit *FinishNormal() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	assert(!(pinf->flags&PIF_NO_MORE));
 	ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->normal=1;
@@ -248,12 +240,11 @@ static  COnSyscallExit *FinishNormal() {
 	sce->next=pinf->sc_on_exit;
 	pinf->sc_on_exit=sce;
 
-	pinf->flags|=PIF_NO_MORE;return sce;
+	return sce;
 }
 
 static COnSyscallExit *FinishPass1NoQueue(int64_t code) {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	assert(!(pinf->flags&PIF_NO_MORE));
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=0;
 	sce->ret_code=code;
@@ -262,7 +253,6 @@ static COnSyscallExit *FinishPass1NoQueue(int64_t code) {
 	sce->next=pinf->sc_on_exit;
 	pinf->sc_on_exit=sce;
 
-	pinf->flags|=PIF_NO_MORE;
 	return sce;
 }
 
@@ -699,10 +689,12 @@ static void InterceptPtrace() {
   intercept:
     SetSyscall(
         20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+        COnSyscallExit *osce;
     if(failed)
-    FinishFail(ret);
-    else
-    FinishPass0();
+		osce=FinishFail(ret);
+    else {
+		osce=FinishPass1(ret);
+	}
     // I ran *getpid* instead of ptrace,that means RAX has pid
     pinf = GetProcInfByPid(GetReturn(NULL));
     break;
@@ -2107,8 +2099,7 @@ int main(int argc, const char *argv[], const char **env) {
 			    if(have->on_exit_cb)
 					have->on_exit_cb(have);
 				free(have);
-				pinf->flags&=~PIF_NO_MORE;
-				goto defacto;
+					goto defacto;
 			  }
 			  write_to=&have->next;
 			  have=have->next;
