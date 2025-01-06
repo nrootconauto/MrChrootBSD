@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <libutil.h>
+#include <pthread.h>
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
@@ -46,6 +47,7 @@ class (CWaitEvent) {
 	CWaitEvent *last,*next;
 	int code;
 	pid_t from;
+	pid_t parent;
 	/* See wait4(2)
 	 * Use`d wih P_UID/P_GID/P_SID
 	 */
@@ -57,8 +59,10 @@ class (CWaitEvent) {
 #define PIF_PTRACE_FOLLOW_FORK 2
 #define PIF_PTRACE_LWP_EVENTS 4
 #define PIF_TRACE_ME 8 //"chrooted" Debugger wants first dibs on the first SIGTRAP
+#define PIF_PTRACE_FOLLOW_VFORK 16
 #define PIF_EXITED 32 
 #define PIF_TO_SCX_ONLY 64 
+#define PIF_BORN 128
 /*
  * 21 Nroot here
  * I will end Chrooted strings with "\00\01\02\00"
@@ -95,8 +99,6 @@ static char *C(const char *p) {
 		return (char*)p;
 	}
 	if(memcmp(palidrome,MC_UNCHROOTED_ENDING,4)) {
-		puts("UNDEF_ENDING");
-		puts(st);
 	}
 	strcpy(st,p);
 	GetChrootedPath(st,st);
@@ -111,8 +113,6 @@ static char *U(const char*p) {
 		return (char*)p;
 	}
 	if(memcmp(palidrome,MC_CHROOTED_ENDING,4)) {
-		puts("UNDEF_ENDING2");
-		puts(p);
 	}
 	strcpy(st,p);
 	SetEnding(st,MC_UNCHROOTED_ENDING);
@@ -122,6 +122,7 @@ static char *U(const char*p) {
 class (COnSyscallExit) {
 	struct COnSyscallExit *next;
 	void (*on_exit_cb)(struct COnSyscallExit *);
+	int64_t no_continue; //Set this in on_exit_cb
 	int64_t ret_code;
 	int64_t tid;
 	char *restore1;
@@ -130,6 +131,9 @@ class (COnSyscallExit) {
 	char *restore_ptr2;
 	int64_t restore_len1;
 	int64_t restore_len2;
+	int64_t user_data; /* See notes in UpdateWait */
+	int64_t from_syscall; /* Only used with wait and freinds */
+	int64_t _use_args[6];
 	char error,normal;
 };
 class (CProcInfo) {
@@ -411,11 +415,11 @@ static int64_t GetProcCwd(char *to) {
   return res_cnt;
 }
 static void PTraceRestoreBytes(void *pt_ptr, void *backup, size_t len) {
-  assert(PTraceWrite(mc_current_pid, pt_ptr, backup, len) == len);
+  assert(PTraceWrite(mc_current_tid, pt_ptr, backup, len) == len);
 }
 
 static void PTraceWriteBytes(void *pt_ptr, const void *st, size_t len) {
-  assert(PTraceWrite(mc_current_pid, pt_ptr, st, len) == len);
+  assert(PTraceWrite(mc_current_tid, pt_ptr, st, len) == len);
 }
 
 #define declval(T) (*(T *)0ul)
@@ -530,6 +534,8 @@ static int64_t IsChildProc(pid_t child, pid_t parent) {
   return IsChildProc(cinf->parent, parent);
 }
 static void InterceptPtrace() {
+  FinishFail(ENOSYS);
+  return; 
   pid_t pid = mc_current_pid;
   int req = GetArg(0);
   pid_t who = GetArg(1);
@@ -537,15 +543,13 @@ static void InterceptPtrace() {
   int64_t data = GetArg(3), ret = 0;
   CProcInfo *pinf;
   int failed = 0;
-  GetProcInfByPid(who)->debugged_by = pid;
   switch (req) {
   case PT_TRACE_ME:
-    pinf = GetProcInfByPid(pid);
+    pinf = GetProcInfByPid(mc_current_pid);
     SetSyscall(
-        20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
-    FinishPass0();
+			20); // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
     pinf->flags |= PIF_TRACE_ME;
-    pinf->debugged_by=pid;
+    pinf->debugged_by=pinf->parent;
     pinf->ptrace_event_mask = PL_FLAG_EXEC;
     break;
   case PT_CONTINUE:
@@ -589,7 +593,6 @@ static void InterceptPtrace() {
     goto use_host_ptrace;
   case PT_GETREGSET:
   case PT_SETREGSET:
-    /*printf("imp layer\n");*/
     ret = -1;
     failed = 1;
     break;
@@ -615,12 +618,22 @@ static void InterceptPtrace() {
     else if (req == PT_GETGSBASE)
       data = sizeof(unsigned long);
     // Write nto poo poo tasks addres space
-    void *dumb = calloc(1, data);
+    void *dumb = calloc(1, data+sizeof(struct ptrace_lwpinfo));
     ret = ptrace(req, who, dumb, data);
     if (ret == -1) {
       ret = -errno;
       failed = 1;
     }
+    if(req==PT_LWPINFO) {
+		struct ptrace_lwpinfo *inf=dumb;
+		CProcInfo *dpinf=GetProcInfByPid(mc_current_pid);
+		pinf=GetProcInfByPid(mc_current_pid);
+		if(pinf->flags&PIF_BORN) {
+			inf->pl_event=PL_EVENT_NONE;
+			inf->pl_flags=-1; //wut
+			pinf->flags&=~PIF_BORN;
+		}
+	}
     PTraceWriteBytes(addr, dumb, data);
     free(dumb);
     goto intercept;
@@ -681,6 +694,7 @@ static void InterceptPtrace() {
   }
   default:
   use_host_ptrace:
+  failed=0;
     if (req == PT_READ_D || req == PT_READ_I)
       ret = ptrace(req, who, addr, data);
     else {
@@ -695,8 +709,6 @@ static void InterceptPtrace() {
     else {
 		osce=FinishPass1(ret);
 	}
-    // I ran *getpid* instead of ptrace,that means RAX has pid
-    pinf = GetProcInfByPid(GetReturn(NULL));
     break;
   case PT_LWP_EVENTS:
     GetProcInfByPid(who)->flags |= PIF_PTRACE_LWP_EVENTS;
@@ -729,7 +741,7 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
   CProcInfo *pinfw = NULL;
   CProcInfo *pinfp = NULL;
   for (wev = wait_events.next; wev != &wait_events; wev = wev->next) {
-    int is_parent = IsParentProc(pid, wev->from);
+    int is_parent = IsParentProc(pid, wev->from)||pid==wev->parent;
     if (_idtype == 0) {
       if (who == -1 && is_parent) { // Any child
         return wev;
@@ -773,13 +785,22 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
   }
   return NULL;
 }
+static void *SCRemoteNoBlock(void *s) {
+	COnSyscallExit *osce=s;
+    struct ptrace_sc_remote rmt;
+	memset(&rmt,0,sizeof rmt);
+	rmt.pscr_syscall = 7;
+    rmt.pscr_nargs = 4;
+    rmt.pscr_args = osce->_use_args;
+	ptrace(PT_SC_REMOTE,osce->tid,&rmt,sizeof(rmt));
+    return NULL;
+}
 static void UpdateWait(COnSyscallExit *un) {
-	(void)un;
+	char use_delegated=1;
   CProcInfo *cur, *cur2;
   CTidWait *waiter, *next_waiter;
   CWaitEvent *wev;
   int *write_code_to, who, wflags;
-  struct ptrace_sc_remote rmt;
   int64_t args4[4];
   int tid, pass;
   char failed,interupt;
@@ -792,20 +813,10 @@ static void UpdateWait(COnSyscallExit *un) {
     pass = 0;
     if(cur->pid!=mc_current_pid) 
        goto next;
-    /* 21 Nroot here
-     * If we are here,its because we EXITED a wait(a safe place to do stuff)
-     * 
-     *  1- If we "naturally" exited wait,be sure to remove all "fuffiled" waited.
-     * 
-     *  2 - If we got a SIGCHLD(unnatural exit from FORCED SIGCHLD from MrChrootBSD),be sure
-     *    insert our emulated ptrace stuff
-     **/
       write_code_to = waiter->write_code_to;
       wflags = waiter->wflags;
       who=waiter->who;
-      interupt=inf.pl_event==PL_EVENT_SIGNAL;
-      printf("%d,%d,%d\n",cur->pid,who,interupt);
-      if(!interupt) {
+      if(!use_delegated) {
           who=ABIGetReturn(tid,&failed);
 		  pass=1;
 		  int got;
@@ -816,7 +827,6 @@ static void UpdateWait(COnSyscallExit *un) {
 				next=wev->next;
 				if(wev->code==got&&wev->from==who) {
 					RemoveWaitEvent(wev);
-					puts("REM");
 				}
 			}
 		  } else {
@@ -827,35 +837,38 @@ static void UpdateWait(COnSyscallExit *un) {
 			  abort();
 		  }
 	  } else {
-		  puts("FAIL");
     wait4:;
       if (wev = EventForWait(cur->pid, who, 0)) {
-		  SetArg(0,wev->from);
 		  PTraceWriteBytes(write_code_to,&wev->code,sizeof(int));
-          RemoveWaitEvent(wev);
+		  FinishPass1(wev->from);
           pass = 1;
-          puts("ASSPONY");
           goto next;
       }
       // if WNOHANG was set,return as usale
       if (wflags & WNOHANG) {
         pass = 1;
+        FinishPass1(0);
         goto next;
       }
 	  }
     next:;
       if (pass) {
+		  if(wev&&!(wflags&WNOWAIT))
+			RemoveWaitEvent(wev);
         waiter->next->last = waiter->last;
         waiter->last->next = waiter->next;
         free(waiter);
+        return;
       }
   }
+real:;
 }
 static void DelegatePtraceEvent(pid_t who, int code) {
   if (who) {
     CWaitEvent *ev = calloc(1, sizeof(CWaitEvent)), *tmp;
     CProcInfo *inf = GetProcInfByPid(who);
     ev->from = who;
+    ev->parent=inf->parent;
     ev->code = code;
     ev->uid = inf->euid;
     ev->gid = inf->egid;
@@ -864,13 +877,38 @@ static void DelegatePtraceEvent(pid_t who, int code) {
     ev->next = &wait_events;
     ev->next->last = ev;
     ev->last->next = ev;
-    printf("EV:%d,%d\n",who,code);
-    if(inf->debugged_by) printf("WANT:%d\n",inf->debugged_by);
   }
+  pid_t oldp=mc_current_pid,oldt=mc_current_tid;
+  CTidWait *cur;
+  for(cur=waiters.next;cur!=&waiters;cur=cur->next) {
+	  mc_current_pid=cur->pid;
+	  mc_current_tid=cur->tid;
+	  UpdateWait(NULL);
+  }
+  mc_current_pid=oldp;
+  mc_current_tid=oldt;
 }
 // Returns 1 if unpaused,else 0
 static int InterceptWait(int who, int *write_to,int wflags) {
-  CProcInfo *inf = GetProcInfByPid(mc_current_pid);
+	CProcInfo *inf = GetProcInfByPid(mc_current_pid);
+  /* 21 Nroot here
+	 * Here's the procedure,I will run a dummy "WNOWAIT|WNOHANG" to check for an existing signal
+	 * If it fails,I "run the real one".
+	 * 
+	 * I do
+	 *   1st want->DUMMY(WNOHANG|WNOWAIT)
+	 *   2nd DUMMY(WNOHANG|WNOWAIT)->user_data==1
+	 *   3rd IF user_data==1 and from wait4(sc 7) then do "real"
+	 */
+  COnSyscallExit *osce=inf->sc_on_exit;
+  while(osce) {
+	  if(osce->tid==mc_current_tid&&osce->user_data==1&&osce->from_syscall==7) {
+		  ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
+		  return 0;
+	  }
+	  osce=osce->next;
+  }
+  int64_t a3=GetArg(3);
   CTidWait *waiter = calloc(1, sizeof(CTidWait));
   waiter->tid = mc_current_tid;
   waiter->pid = mc_current_pid;
@@ -887,9 +925,9 @@ static int InterceptWait(int who, int *write_to,int wflags) {
   waiter->last->next = waiter;
   waiter->next->last = waiter;
   
-  printf("W:%d,%d,%d\n",mc_current_pid,who,wflags);
-  COnSyscallExit *osce=FinishNormal();
-  osce->on_exit_cb=&UpdateWait;
+  
+  SetArg(2,wflags|WNOHANG);
+  UpdateWait(NULL);
   return 0;
 }
 
@@ -1338,6 +1376,7 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
+    pinf->flags|=PIF_BORN;
     //    waitpid(mc_current_pid, NULL, 0);
   } else {
     char extra_arg_strs[1024][256];
@@ -1414,6 +1453,7 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
+    pinf->flags|=PIF_BORN;
     //    waitpid(mc_current_pid, NULL, 0);
   }
   if (perms & S_ISUID) {
@@ -2004,7 +2044,7 @@ int main(int argc, const char *argv[], const char **env) {
     AddMountPoint("/dev", "/dev");
     if (Xflag) {
       AddMountPoint("/var/run", "/var/run");
-      AddMountPoint("/proc", "/proc");
+      //AddMountPoint("/proc", "/proc");
       AddMountPoint("/tmp", "/tmp"); // Needed for /tmp/.X11-ubix/Xx
     }
   }
@@ -2026,8 +2066,6 @@ int main(int argc, const char *argv[], const char **env) {
         HashTableDone();
         exit(0);
       }
-      if((WIFSIGNALED(cond) || WIFEXITED(cond)))
-      printf("EX:%d\n",pid2);
       struct ptrace_lwpinfo inf;
       CProcInfo *pinf = GetProcInfByPid(pid2);
       ptrace(PT_LWPINFO, pid2, (caddr_t)&inf, sizeof inf);
@@ -2064,6 +2102,9 @@ int main(int argc, const char *argv[], const char **env) {
           pid_t to = pinf->debugged_by;
           if (!to)
             to = pinf->parent;
+          if(pinf->flags&PIF_BORN) {
+			inf.pl_flags=PL_FLAG_BORN|PL_FLAG_EXEC;
+		  }
           if (pinf->ptrace_event_mask &
               (inf.pl_flags & ~(PL_FLAG_SCE | PL_FLAG_SCX))) {
             kill(to, SIGCHLD);
@@ -2098,7 +2139,10 @@ int main(int argc, const char *argv[], const char **env) {
 			    COnSyscallExit *have2=have->next;
 			    if(have->on_exit_cb)
 					have->on_exit_cb(have);
+				bool no_cont=have->no_continue;
 				free(have);
+				if(no_cont) //Dont continue the syscall
+					goto next;
 					goto defacto;
 			  }
 			  write_to=&have->next;
@@ -2119,6 +2163,10 @@ int main(int argc, const char *argv[], const char **env) {
         pinf->flags &= ~PIF_EXITED;
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
         ptrace(PT_LWP_EVENTS, mc_current_tid, NULL, 1);
+		  if(pinf->flags&PIF_TRACE_ME) {
+			  pinf->flags&=~PIF_TRACE_ME;
+			  DelegatePtraceEvent(mc_current_pid,cond);
+			 } else
         ptrace(PT_TO_SCE, mc_current_tid, (void *)1,
                NextKillSig(mc_current_pid));
         continue;
@@ -3156,6 +3204,7 @@ int main(int argc, const char *argv[], const char **env) {
         ptrace(PT_TO_SCE, mc_current_tid, (void *)1,
                NextKillSig(mc_current_pid));
       }
+next:;
     }
   } else if (!tflag) {
     const char *dummy_argv[argc - 2 + 1 + 1];

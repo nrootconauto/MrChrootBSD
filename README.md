@@ -9,13 +9,11 @@
 ## Features
   Here is a list
 - Do chroot in userspace
-- Partial `ptrace` emulation(limited,you can run `gdb` in your MrChroot's sort of and it will make you happy maybe)
 - (Currently) buggy user permisions database(`perms.db` using `db(3)`)
 - X11 within MrChrootBSD easily with the `-X` option.
 
 ## Non-Features
   Some of these will be removed(added to features) in the future
-- Full `ptrace` emulation(Dont rely on `PT_TO_SCE`/`PT_TO_SCX` to work).
 - jails
 - daemons
 
@@ -32,9 +30,9 @@ cd ..
 cmake .
 make
 cp /etc/resolv.conf chroot/etc # networking
-./mchroot -t base.txz chroot # Accounts for perms.db database
-./mchroot -t lib32.txz chroot # Accounts for perms.db database
-./mchroot chroot /bin/sh
+./mrchroot -t base.txz chroot # Accounts for perms.db database
+./mrchroot -t lib32.txz chroot # Accounts for perms.db database
+./mrchroot chroot /bin/sh
 # pkg etc
 ``` 
 
@@ -65,4 +63,3 @@ I could use help in these areas,I will probably get them done myself but if you 
  3. Implement` procctl(3)` reapers.
  4. Make sure `wait(2)` actually works(probably does)
  5. Validate existing `sysctl(3)` stuff(Probably works).
- 6. **MAKE A ROBUST WAY TO TEST OF A PATH IS CHROOTED/UNCHROOTED**(like make the paths start with '\01' or '\02')

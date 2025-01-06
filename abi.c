@@ -12,7 +12,7 @@
 
 #ifdef __x86_64__
 #define Ones(x) ((1ul << x) - 1) // Ones(4) -> 0xF (0b1111)
-#define Getregs(p, r) ptrace(PT_GETREGS, (p), (caddr_t)(r), 0)
+#define Getregs(p, r) if(0!=ptrace(PT_GETREGS, (p), (caddr_t)(r), 0)) abort();
 #define Setregs(p, r) ptrace(PT_SETREGS, (p), (caddr_t)(r), 0)
 
 int64_t ABIGetReturn(pid_t pid, bool *failed) {

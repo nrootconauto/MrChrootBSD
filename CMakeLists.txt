@@ -17,7 +17,7 @@ set_target_properties(${PROJECT_NAME} pl_hack
     C_VISIBILITY_PRESET hidden)
 
 target_link_libraries(pl_hack PRIVATE dl)
-target_link_libraries(mrchroot PRIVATE procstat util)
+target_link_libraries(mrchroot PRIVATE procstat util pthread)
 
 set(FLAGS -w -fno-stack-protector -fno-strict-aliasing)
 target_compile_options(mrchroot PRIVATE ${FLAGS})
