@@ -174,7 +174,6 @@ static int NextKillSig(pid_t pid) {
 	}
 	return ret;
 }
-
 static int ptrace2(int a,pid_t p,void *add ,int d) {
 	int r=ptrace(a,p,add,d);
 	//if(r) printf("%d,%d,%d\n",a,p,errno);
@@ -384,6 +383,23 @@ static int64_t FdToStr(char *to, int fd) {
   return res_cnt;
 }
 
+static int64_t HasChildren(pid_t p) {
+  if (!ps)
+    ps = procstat_open_sysctl();
+  // See /usr/src/use.bin/procstat in FreeBSD
+  unsigned cnt=0,has_child=0;
+  //Savage Mode3
+  struct kinfo_proc *kprocs = procstat_getprocs(ps, KERN_PROC_PROC, 0, &cnt);
+  for (unsigned i = 0; i < cnt; i++) {
+	  if(kprocs[i].ki_ppid==p) {
+		has_child=1;
+		break;
+	  }
+  }
+  procstat_freeprocs(ps, kprocs);
+  return has_child;
+}
+
 static int64_t GetProcCwd(char *to) {
   unsigned cnt = 0;
   pid_t pid = mc_current_pid;
@@ -485,6 +501,8 @@ static int64_t ProcIsAlive(pid_t pid) {
     return 0;
   return 1;
 }
+
+
 static void RemoveWaitEvent(CWaitEvent *ev) {
   CWaitEvent *last = ev->last;
   CWaitEvent *next = ev->next;
@@ -534,8 +552,6 @@ static int64_t IsChildProc(pid_t child, pid_t parent) {
   return IsChildProc(cinf->parent, parent);
 }
 static void InterceptPtrace() {
-  FinishFail(ENOSYS);
-  return; 
   pid_t pid = mc_current_pid;
   int req = GetArg(0);
   pid_t who = GetArg(1);
@@ -628,11 +644,7 @@ static void InterceptPtrace() {
 		struct ptrace_lwpinfo *inf=dumb;
 		CProcInfo *dpinf=GetProcInfByPid(mc_current_pid);
 		pinf=GetProcInfByPid(mc_current_pid);
-		if(pinf->flags&PIF_BORN) {
-			inf->pl_event=PL_EVENT_NONE;
-			inf->pl_flags=-1; //wut
-			pinf->flags&=~PIF_BORN;
-		}
+
 	}
     PTraceWriteBytes(addr, dumb, data);
     free(dumb);
@@ -816,28 +828,11 @@ static void UpdateWait(COnSyscallExit *un) {
       write_code_to = waiter->write_code_to;
       wflags = waiter->wflags;
       who=waiter->who;
-      if(!use_delegated) {
-          who=ABIGetReturn(tid,&failed);
-		  pass=1;
-		  int got;
-		  if(write_code_to) {
-		    PTraceRead(mc_current_tid,&got,write_code_to,sizeof(int));
-		    CWaitEvent *wev,*next;
-		    for (wev = wait_events.next; wev != &wait_events; wev = next) {
-				next=wev->next;
-				if(wev->code==got&&wev->from==who) {
-					RemoveWaitEvent(wev);
-				}
-			}
-		  } else {
-			  /* 21 Nroot
-			   * You shouldnt end up here
-			   * In InterceptWait i use a "dumb zone" .
-			   */
-			  abort();
-		  }
-	  } else {
     wait4:;
+    if(!HasChildren(cur->pid)) {
+		FinishFail(-ECHILD);
+		goto remove_waiter;
+	}
       if (wev = EventForWait(cur->pid, who, 0)) {
 		  PTraceWriteBytes(write_code_to,&wev->code,sizeof(int));
 		  FinishPass1(wev->from);
@@ -850,11 +845,11 @@ static void UpdateWait(COnSyscallExit *un) {
         FinishPass1(0);
         goto next;
       }
-	  }
     next:;
       if (pass) {
 		  if(wev&&!(wflags&WNOWAIT))
 			RemoveWaitEvent(wev);
+remove_waiter:
         waiter->next->last = waiter->last;
         waiter->last->next = waiter->next;
         free(waiter);
@@ -891,23 +886,6 @@ static void DelegatePtraceEvent(pid_t who, int code) {
 // Returns 1 if unpaused,else 0
 static int InterceptWait(int who, int *write_to,int wflags) {
 	CProcInfo *inf = GetProcInfByPid(mc_current_pid);
-  /* 21 Nroot here
-	 * Here's the procedure,I will run a dummy "WNOWAIT|WNOHANG" to check for an existing signal
-	 * If it fails,I "run the real one".
-	 * 
-	 * I do
-	 *   1st want->DUMMY(WNOHANG|WNOWAIT)
-	 *   2nd DUMMY(WNOHANG|WNOWAIT)->user_data==1
-	 *   3rd IF user_data==1 and from wait4(sc 7) then do "real"
-	 */
-  COnSyscallExit *osce=inf->sc_on_exit;
-  while(osce) {
-	  if(osce->tid==mc_current_tid&&osce->user_data==1&&osce->from_syscall==7) {
-		  ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
-		  return 0;
-	  }
-	  osce=osce->next;
-  }
   int64_t a3=GetArg(3);
   CTidWait *waiter = calloc(1, sizeof(CTidWait));
   waiter->tid = mc_current_tid;
@@ -928,7 +906,7 @@ static int InterceptWait(int who, int *write_to,int wflags) {
   
   SetArg(2,wflags|WNOHANG);
   UpdateWait(NULL);
-  return 0;
+  return 0;	
 }
 
 int64_t NormailizePath(char *to, const char *path) {
@@ -1355,8 +1333,8 @@ static void InterceptExecve() {
     SetEnding(poop_ant, MC_UNCHROOTED_ENDING);
     GetChrootedPath(chroot, poop_ant);
     bulen = WritePTraceString(backup, orig_ptr, chroot);
-    ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
-    waitpid(mc_current_pid,NULL,0);
+		ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
+		waitpid(mc_current_pid,NULL,0);
     PTraceRestoreBytes(orig_ptr, backup, bulen);
     args[0] = GetReturn(NULL);
     args[1] = (int64_t)argv;
@@ -1376,7 +1354,6 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    pinf->flags|=PIF_BORN;
     //    waitpid(mc_current_pid, NULL, 0);
   } else {
     char extra_arg_strs[1024][256];
@@ -1453,7 +1430,6 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    pinf->flags|=PIF_BORN;
     //    waitpid(mc_current_pid, NULL, 0);
   }
   if (perms & S_ISUID) {

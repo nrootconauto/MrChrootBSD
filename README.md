@@ -11,6 +11,8 @@
 - Do chroot in userspace
 - (Currently) buggy user permisions database(`perms.db` using `db(3)`)
 - X11 within MrChrootBSD easily with the `-X` option.
+- Use `gdb` to debug stuff within the MrChrootBSD(limited `ptrace` support)
+- **THIS IS MAINLY A HUMANS ATTEMPT TO LOOK AT FreeBSD INTERNALS(Educational)**
 
 ## Non-Features
   Some of these will be removed(added to features) in the future
