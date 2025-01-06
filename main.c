@@ -29,6 +29,7 @@
 #include <sys/un.h>
 #include <libutil.h>
 #include <pthread.h>
+#include <sys/procctl.h>
 #define class(x)                                                               \
   typedef struct x x;                                                          \
   struct x
@@ -1725,7 +1726,7 @@ static void InterceptLinkat() {
    COnSyscallExit *osce=FinishNormal();
   OnSyscallExitSetBackup1(osce,write_to, old, total_len);
 }
-static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
+static COnSyscallExit *InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
                              void *_new, size_t _new_sz) {
   int ret = 0;
   if (nlen <= 0) {
@@ -1737,8 +1738,7 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
     SetArg(3, (int64_t)_old_sz);
     SetArg(4, (int64_t)_new);
     SetArg(5, _new_sz);
-    FinishNormal();
-    return;
+    return FinishNormal();
   }
   int *name = calloc(sizeof(int), nlen);
   PTraceRead(mc_current_tid, name, _name, nlen * sizeof(int));
@@ -1803,7 +1803,10 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
           ret_ln = unchrooted_len;
         dump_files:
           if (ret) {
-			  FinishFail(ret);
+			  free(ret_files);
+          free(real_ret_files);
+          
+			  return FinishFail(ret);
           } else {
             if (_old) {
               PTraceRead(mc_current_tid, &max_sz, _old_sz, sizeof(size_t));
@@ -1816,7 +1819,7 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
           }
           free(ret_files);
           free(real_ret_files);
-          return;
+          FinishPass0();
           break;
           ;
         case KERN_SECURELVL:
@@ -1909,13 +1912,12 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
             }
           }
           SetSyscall(20); // getpid
-		  if(ret) {
-			 FinishFail(ret); 
+		  free(ret_procs);
+          if(ret) {
+			 return FinishFail(ret); 
 		  } else {
-			  FinishPass0();
+			  return FinishPass0();
 		  }
-          free(ret_procs);
-          return;
         }
       }
     }
@@ -1925,12 +1927,15 @@ static void InterceptSysctl0(int *_name, int nlen, void *_old, size_t *_old_sz,
 }
 static void InterceptSysctlByname() {
   char name[1024];
-  size_t len = 0;
+  size_t len = 100;
+  int poodles[100];
   void *write_to = (char *)GetArg(0);
   int *have = NULL, *backup = NULL;
   PTraceRead(mc_current_tid, name, write_to, GetArg(1));
   name[GetArg(1)] = 0;
-  if (sysctlnametomib(name, NULL, &len)) {
+  puts("a");
+  puts(name);
+  if (sysctlnametomib(name, poodles, &len)) {
   fail:;
     if (have)
       free(have);
@@ -1940,16 +1945,18 @@ static void InterceptSysctlByname() {
     FinishFail(-errno);
     return;
   }
+  puts("b");
   have = calloc(sizeof(int), len);
   backup = calloc(sizeof(int), len);
   if (sysctlnametomib(name, have, &len))
     goto fail;
+  puts("c");
   PTraceRead(mc_current_tid, backup, write_to, sizeof(int) * len);
   PTraceWrite(mc_current_tid, write_to, have, sizeof(int) * len);
   SetSyscall(202); // "Normal" sysctl
-  InterceptSysctl0(write_to, len, (void *)GetArg(2), (void *)GetArg(3),
+  COnSyscallExit *osce=InterceptSysctl0(write_to, len, (void *)GetArg(2), (void *)GetArg(3),
                    (void *)GetArg(4), GetArg(5));
-  PTraceWrite(mc_current_tid, write_to, backup, sizeof(int) * len);
+  OnSyscallExitSetBackup1(osce,write_to,backup,sizeof(int) * len);
   free(backup);
   free(have);
 }
@@ -2026,7 +2033,9 @@ int main(int argc, const char *argv[], const char **env) {
   }
 
   if ((pid = fork())) {
+	  procctl(P_PID,0,PROC_REAP_ACQUIRE,NULL);	
     HashTableInit("./perms.db");
+    atexit(&HashTableDone);
     int cond;
     CProcInfo *pinf0 = GetProcInfByPid(pid);
     pinf0->uid = 0;
@@ -2039,7 +2048,10 @@ int main(int argc, const char *argv[], const char **env) {
                            WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
                                WCONTINUED))) {
       if ((WIFSIGNALED(cond) || WIFEXITED(cond)) && pid2 == pid) {
-        HashTableDone();
+		  struct procctl_reaper_kill rkill={0};
+		  rkill.rk_sig=SIGKILL;
+		  rkill.rk_flags=0; //Kill all?
+		  procctl(P_PID,0,PROC_REAP_KILL,&rkill);
         exit(0);
       }
       struct ptrace_lwpinfo inf;
@@ -2678,6 +2690,13 @@ int main(int argc, const char *argv[], const char **env) {
           PERMCHECK(F_OK | R_OK, 0);
           INTERCEPT_FILE1(0);
         } break;
+        
+        case 195: //setrlimit
+        {
+			ABISetSyscall(mc_current_tid,20); //getpid
+			FinishPass0();
+		}
+		break;
         case 198: { // 64bit syscall
           break;
         }
@@ -3060,11 +3079,6 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         }
         case 544: { // procctl
-          idtype_t idt = GetArg(0);
-          long id = GetArg(1);
-          int cmd = GetArg(2);
-          SetSyscall(20); // do nothing
-          FinishFail(-EBUSY);
           break;
         }
         case 546: // futimes

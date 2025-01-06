@@ -46,7 +46,7 @@ cp /etc/resolv.conf chroot/etc # networking
 ### Copy `/etc/resolv.conf` into `/etc`.
   You'll want to do this for networking
 ### passwd root and install daos
-  su wont work for now(if ever). doas works like a charm when configured correctly.
+  `su` wont work for now(if ever). `doas` works like a charm when configured correctly.
   ```sh
   pkg install doas
   echo 'permit nopass :wheel' > /usr/local/etc/doas.conf
