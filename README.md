@@ -3,8 +3,7 @@
 
 # NOTICE
 
-  **This software is going under major refactors including perimision emulation. Expect something juicy next week. Dont use it for anything serious now(or at all).**
-
+  **This software is still in it's infancy and should not be used for anything serious other than like educational stuff.**
 
 ## Features
   Here is a list
@@ -43,8 +42,11 @@ cp /etc/resolv.conf chroot/etc # networking
   Use `-X` option to allow /var/run and XAUTHORITY to be set so you can run X11 apps.
 
 ## Things to do after chroot'ing
+
 ### Copy `/etc/resolv.conf` into `/etc`.
+
   You'll want to do this for networking
+
 ### passwd root and install daos
   `su` wont work for now(if ever). `doas` works like a charm when configured correctly.
   ```sh
@@ -57,11 +59,62 @@ cp /etc/resolv.conf chroot/etc # networking
 
   It uses `ptrace` to intercept the calls and reroute the file names to the *host* filesystem. Certian caeveats such as FreeBSD using the host filesystem for `execvpe` or telling the full path of the executable via `elf_aux_info`  are patched in a `LD_PRELOAD` library called `libpl_hack.so` in `preload_hack.c`.
 
+### Pt.1 System Calls Mutation
+
+  The main "loop" of MrChrootBSD is in main which waits for syscall exits. When entering a syscall,you can do these
+
+```c
+COnSyscallExit *osce=FinishNormal();
+osce=FinishPass0();
+osce=FinishPass1(value);
+osce=FinishFail(-errno);
+```
+
+  This will run trigger a callback when the syscall for `mc_current_tid` is exited,and will do lit stuff like change the retyurn values,or restore bytes of memory.
+
+  MrChroot will insert "chrooted" filepaths in when enterin' syscalls,and will restore the original values on syscall exit,do this:
+
+```c
+osce=FinishPass0();
+//You can restore 2 streams of bytes on 1 exit
+OnSyscallExitSetBackup1(osce,ptr,bytes_to_restore,len);
+OnSyscallExitSetBackup2(osce,ptr,bytes_to_restore,len);
+```
+
+### Pt.2 Chrooted x Unchrooted Paths
+
+  When chrooting paths,you might get them mixed up,MrChroot does poo poo sauce checking after the ending of strings(it checks for `MC_CHROOTED_ENDING` x `MC_UNCHROOTED_ENDING`).
+
+  You porbably can ignore this,just use the `C` and `U` functions.
+
+```c
+char path[1024];
+strcpy(path,"/tmp")
+char *path_ptr=C(path);
+char *unchrooted=U(path);
+```
+
+### Pt.3 The Permisions table
+
+  Look at hash.h,this stores file permisions x ownership.
+
+```c
+/* ... */
+class(CHashEntry) {
+	uint32_t perms;
+	uid_t uid;
+	gid_t gid;
+};
+void HashTableSet(const char *fn,uid_t u,gid_t g,uint32_t perms);
+CHashEntry *HashTableGet(CHashEntry *e,const char *fn);
+void HashTableRemove(const char *fn);
+/* ... */
+```
+
 ## Development Please ;)
 I could use help in these areas,I will probably get them done myself but if you want to make my day:
 
  1. Add support for `riscv64` and `arm64` in `abi.c`.
- 2. Make the tool extremely fun to use(have emojis and stuff)
- 3. Implement` procctl(3)` reapers.
- 4. Make sure `wait(2)` actually works(probably does)
- 5. Validate existing `sysctl(3)` stuff(Probably works).
+ 2. Make sure `wait(2)` actually works(probably does)
+ 3. Validate existing `sysctl(3)` stuff(Probably works).
+ 4. Write unit tests.

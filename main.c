@@ -1819,9 +1819,7 @@ static COnSyscallExit *InterceptSysctl0(int *_name, int nlen, void *_old, size_t
           }
           free(ret_files);
           free(real_ret_files);
-          FinishPass0();
-          break;
-          ;
+          return FinishPass0();
         case KERN_SECURELVL:
           /* 21 Nroot here,maybe i will implement this in the future
            *
@@ -1933,8 +1931,6 @@ static void InterceptSysctlByname() {
   int *have = NULL, *backup = NULL;
   PTraceRead(mc_current_tid, name, write_to, GetArg(1));
   name[GetArg(1)] = 0;
-  puts("a");
-  puts(name);
   if (sysctlnametomib(name, poodles, &len)) {
   fail:;
     if (have)
@@ -1945,12 +1941,10 @@ static void InterceptSysctlByname() {
     FinishFail(-errno);
     return;
   }
-  puts("b");
   have = calloc(sizeof(int), len);
   backup = calloc(sizeof(int), len);
   if (sysctlnametomib(name, have, &len))
     goto fail;
-  puts("c");
   PTraceRead(mc_current_tid, backup, write_to, sizeof(int) * len);
   PTraceWrite(mc_current_tid, write_to, have, sizeof(int) * len);
   SetSyscall(202); // "Normal" sysctl
