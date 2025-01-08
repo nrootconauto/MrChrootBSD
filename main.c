@@ -2751,6 +2751,18 @@ int main(int argc, const char *argv[], const char **env) {
 			  FinishFail(-EPERM);
           }
         } break;
+        case 188:
+        puts("MrChrootBSD doesnt want FreeBSD11 calls");
+		FinishFail(-ENOSYS); //No FreeBSD 11 im sorry
+        break;
+        case 189:
+        puts("MrChrootBSD doesnt want FreeBSD11 calls");
+		FinishFail(-ENOSYS); //No FreeBSD 11 im sorry
+        break;
+        case 190:
+        puts("MrChrootBSD doesnt want FreeBSD11 calls");
+		FinishFail(-ENOSYS); //No FreeBSD 11 im sorry
+        break;
         case 191: { // pathconf
           PERMCHECK(F_OK | R_OK, 0);
           INTERCEPT_FILE1(0);
