@@ -187,12 +187,14 @@ static int ptrace2(int a,pid_t p,void *add ,int d) {
 static pid_t mc_current_pid;
 static int mc_current_tid; //LWP id
 static void OnSyscallExitSetBackup1(COnSyscallExit *e,const char *to,char *a,int64_t l) {
+	if(e->restore1) abort();
 	e->restore1=calloc(1,l);
 	e->restore_ptr1=to;
 	e->restore_len1=l;
 	memcpy(e->restore1,a,l);
 }
 static void OnSyscallExitSetBackup2(COnSyscallExit *e,const char *to,char *a,int64_t l) {
+	if(e->restore2) abort();
 	e->restore2=calloc(1,l);
 	e->restore_ptr2=to;
 	e->restore_len2=l;
@@ -1059,8 +1061,7 @@ char *DatabasePathForFile(char *to, const char *path) {
 static char *ChrootedRealpath(char *to, char *path) {
   char dst[1024];
   path = C(path);
-  GetChrootedPath(dst, path);
-  UnChrootPath(to, dst);
+  UnChrootPath(to, path);
   return to;
 }
 static uint32_t FilePerms(char *fn) {
@@ -1572,7 +1573,6 @@ static void Intercept__Getcwd() {
   void *orig_ptr;
   char cwd[1024];
   olen = GetProcCwd(cwd);
-  UnChrootPath(cwd,cwd);
   orig_ptr = (void *)GetArg(0);
   cap = GetArg(1);
   COnSyscallExit *osce=FinishPass0();
@@ -2097,6 +2097,7 @@ int main(int argc, const char *argv[], const char **env) {
     pinf0->ngrps = 1;
     pinf0->groups[0] = 0; // Wheel
     pinf0->chrooted_at=ChrootAt("/");
+    pinf0->login=strdup("root");
     while ((pid2 = waitpid(-1, &cond,
                            WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
                                WCONTINUED))) {
@@ -2192,7 +2193,7 @@ int main(int argc, const char *argv[], const char **env) {
 	  }
       if (inf.pl_flags & PL_FLAG_EXITED) {
         // DelegatePtraceEvent
-        ptrace(PT_TO_SCE, pid2, (void *)1,
+        ptrace(PT_TO_SCE, mc_current_tid, (void *)1,
                0); /* We exited so no need for signal 21 */
         continue;
       }
@@ -2449,7 +2450,12 @@ int main(int argc, const char *argv[], const char **env) {
         case 50: // setlogin
         {
           char ln[MAXLOGNAME];
-          ReadPTraceString(ln, (char *)GetArg(0));
+          CProcInfo *pinf = GetProcInfByPid(pid2);
+          if(ReadPTraceString(ln, (char *)GetArg(0))) {
+			  if(pinf->login)
+			    free(pinf->login);
+			pinf->login=strdup(ln);
+		  }
           FinishPass0();
         }
         case 54: // ioctl
