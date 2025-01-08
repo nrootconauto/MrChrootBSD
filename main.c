@@ -2378,6 +2378,7 @@ int main(int argc, const char *argv[], const char **env) {
           CProcInfo *me = GetProcInfByPid(pid2);
           pid_t want = GetArg(0);
           int poo = GetArg(1);
+          int passed=0;
           if (want > 0) {
             CProcInfo *cur;
             SetSyscall(20); // Dont do anyhthjing(getpid)
@@ -2399,6 +2400,7 @@ int main(int argc, const char *argv[], const char **env) {
                      cur->euid == me->euid) || // cur->euid
                     (poo == SIGCONT && (getsid(want) == getsid(pid2)))) {
                   int e = kill(want, poo);
+                  passed=1;
                   if (e)
                     FinishFail(e);
                   else {
@@ -2412,7 +2414,7 @@ int main(int argc, const char *argv[], const char **env) {
                 }
               }
             }
-	FinishFail(-ESRCH);
+		if(!passed) FinishFail(-ESRCH);
           }
         } break;
         case 39: // getppid TODO
