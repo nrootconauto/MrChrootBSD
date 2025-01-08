@@ -14,5 +14,10 @@ class (CMountPoint) {
   char db_path[1024];
   char document_perms;
 };
+class (CChrootRoot) {
+	CChrootRoot *last,*next;
+	char root[1024];
+	int ref_cnt;
+};
 //May return NULL if the path is not to be documented
 extern char *DatabasePathForFile(char *to, const char *path);
