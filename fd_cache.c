@@ -30,8 +30,9 @@ void FDCacheRem(CFDCache *c,int fd) {
   char *have;
   if(fd<c->size) {
 	  have=c->values[fd];
-	  if(have!=FD_CACHE_NOT_FILE&&have)
+	  if(have!=FD_CACHE_NOT_FILE&&have) {
 		free(have);
+	}
 	  c->values[fd]=NULL;
   }
 };
@@ -54,4 +55,7 @@ char *FDCacheGet(CFDCache *c,int fd) {
 	  return c->values[fd];
   }
   return NULL;
+}
+void FDCacheInvalidate(CFDCache *c,int fd) {
+	FDCacheSet(c,fd,FD_CACHE_NOT_FILE);
 }

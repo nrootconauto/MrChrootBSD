@@ -13,3 +13,4 @@ void FDCacheDel(CFDCache *c);
 CFDCache *FDCacheNew();
 void FDCacheSet(CFDCache*,int,char*);
 char *FDCacheGet(CFDCache*,int);
+void FDCacheInvalidate(CFDCache *c,int fd);

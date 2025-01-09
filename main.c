@@ -337,7 +337,7 @@ static int64_t UnChrootPath(char *to, char *_from) {
   char buf[1024], *cur = buf,from[1024];
   CMountPoint *mp, *best = root_mount;
   int64_t trim, best_len = 0, len, prefix;
-  sprintf(from,"%s/",_from);
+  sprintf(from,"%s",_from);
   for (mp = mount_head.next; mp != &mount_head; mp = mp->next) {
     len = strlen(mp->dst_path);
     if (!strncmp(from, mp->dst_path, len)) {
@@ -373,20 +373,14 @@ static int64_t FdToStr(char *to, int fd) {
     return GetProcCwd(to);
   }
   char *have;
-  if(0)
   if (have = FDCacheGet(pinf->fd_cache, fd)) {
-    if (have == FD_CACHE_NOT_FILE) {
-      if (to) {
-        strcpy(to, "");
-        SetEnding(to, MC_UNCHROOTED_ENDING);
-      }	
-      return 0;
-    }
+    if (have != FD_CACHE_NOT_FILE) {
     if (to) {
       strcpy(to, have);
       SetEnding(to, MC_UNCHROOTED_ENDING);
+      return strlen(have);
     }
-    return strlen(have);
+	}
   }
   if (!ps)
     ps = procstat_open_sysctl();
@@ -401,7 +395,8 @@ static int64_t FdToStr(char *to, int fd) {
 	    if(kfcur->kf_fd==fd) {
 			strcpy(to,kfcur->kf_path);
             SetEnding(to,MC_UNCHROOTED_ENDING);
-			FDCacheSet(pinf->fd_cache, fd, to);
+            UnChrootPath(buf,to);
+			FDCacheSet(pinf->fd_cache, fd, buf);
 			break;
 		}
 	  }
@@ -488,8 +483,7 @@ static void PTraceWriteBytes(void *pt_ptr, const void *st, size_t len) {
 
 #define declval(T) (*(T *)0ul)
 #define Startswith(s, what) (!memcmp((s), (what), strlen(what)))
-static CProcInfo *cache_inf = NULL;
-static pid_t cache_pid = -1;
+static CProcInfo *proc_info_cache[0x10000];
 static void OnSyscallExitDel(COnSyscallExit *g) {
 	if(!g) return;
     OnSyscallExitDel(g->next);
@@ -500,8 +494,8 @@ static void OnSyscallExitDel(COnSyscallExit *g) {
 static void RemoveProc(pid_t pid) {
   CProcInfo *cur, *next, *last;
   CWaitEvent *wev, *ev_next;
-  cache_pid = -1;
-  cache_inf = NULL;
+  if(0<=pid&&pid<0x10000)
+     proc_info_cache[pid]=NULL;
   for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
     if (pid == cur->pid) {
       last = cur->last;
@@ -521,14 +515,12 @@ static void RemoveProc(pid_t pid) {
 static CProcInfo *GetProcInfByPid(pid_t pid) {
   CProcInfo *cur;
   pid_t parent;
-  if (cache_pid == pid) {
-    return cache_inf;
-  }
+  if(0<=pid&&pid<0x10000)
+    if(cur=proc_info_cache[pid])
+		return cur;
   for (cur = proc_head.next; cur != &proc_head; cur = cur->next) {
     if (pid == cur->pid) {
-      cache_inf = cur;
-      cache_pid = pid;
-      return cache_inf;
+      return cur;
     }
   }
   *(cur = calloc(sizeof(*cur), 1)) = (CProcInfo){.next = &proc_head,
@@ -538,8 +530,8 @@ static CProcInfo *GetProcInfByPid(pid_t pid) {
                                                  .fd_cache = FDCacheNew(),
                                                  .ptrace_event_mask = -1};
    cur->chrooted_at=ChrootAt("/");
-  cache_inf = cur;
-  cache_pid = pid;
+  if(0<=pid&&pid<0x10000)
+	proc_info_cache[pid]=cur;
   return cur->last->next   //
          = cur->next->last //
          = cur;
@@ -1262,7 +1254,37 @@ static void InterceptAccess() {
   char what[1024], have[1024];
   { INTERCEPT_FILE1(0); }
 }
+static void DupFD(COnSyscallExit *osce) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	char *have;
+	char fail;
+	int fd=GetReturn(&fail);
+	if(!fail) {
+		if(have=FDCacheGet(pinf->fd_cache,osce->user_data))
+			FDCacheSet(pinf->fd_cache,fd,have);
+	}
+}
+static void DupFD2(COnSyscallExit *osce) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	char *have;
+	char fail;
+	int fd=GetReturn(&fail);
+	if(!fail) {
+		if(have=FDCacheGet(pinf->fd_cache,osce->user_data&0xffFFffFFul))
+			FDCacheSet(pinf->fd_cache,((uint64_t)osce->user_data)>>32,have);
+	}
+}
 
+static void OpenFD(COnSyscallExit *osce) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	char have_str[1024];
+	//Hack alert,on_exit_cb is called after strings are restored(Chrooted strings are restored into unchrooted ones)
+	ReadPTraceString(have_str, (char*)osce->user_data);
+	char fail;
+	int fd=GetReturn(&fail);
+	if(!fail)
+		FDCacheSet(pinf->fd_cache,fd,have_str);
+}
 static void InterceptOpen() {
   CProcInfo *inf = GetProcInfByPid(mc_current_pid);
   int64_t fd, flags = GetArg(1);
@@ -1271,7 +1293,7 @@ static void InterceptOpen() {
   char have_str[1024], chroot[1024];
   ReadPTraceString(have_str, orig_ptr);
   SetEnding(have_str, MC_UNCHROOTED_ENDING);
-  { INTERCEPT_FILE1(0); }
+  { INTERCEPT_FILE1(0); osce->user_data=(int64_t)orig_ptr;osce->on_exit_cb=&OpenFD;}
     if (flags & O_CREAT)
       ChrootDftOwnership(have_str);
 }
@@ -1388,7 +1410,7 @@ static void InterceptExecve() {
     ReadPTraceString(poop_ant, orig_ptr);
     SetEnding(poop_ant, MC_UNCHROOTED_ENDING);
     GetChrootedPath(chroot, poop_ant);
-    bulen = WritePTraceString(backup, orig_ptr, chroot);
+		bulen = WritePTraceString(backup, orig_ptr, chroot);
 		ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,0);
 		waitpid(mc_current_pid,NULL,0);
     PTraceRestoreBytes(orig_ptr, backup, bulen);
@@ -2304,7 +2326,7 @@ int main(int argc, const char *argv[], const char **env) {
           pid_t want=GetArg(0);
           int f=GetArg(2);
           InterceptWait(want, (int*)GetArg(1),f);
-          continue;
+			continue;
           break;
         }
         case 532:{ // wait6
@@ -2352,7 +2374,12 @@ int main(int argc, const char *argv[], const char **env) {
         case 26: // ptrace
           InterceptPtrace();
           break;
-        case 33: // access
+        case 30: //accept
+        {
+			FinishNormal();
+		}
+          break;
+         case 33: // access
           PERMCHECK(R_OK, 0);
           InterceptAccess();
           break;
@@ -2421,6 +2448,10 @@ int main(int argc, const char *argv[], const char **env) {
         case 39: // getppid TODO
           break;
         case 41: { // dup
+			int64_t who=GetArg(0);
+			COnSyscallExit *osce=FinishNormal();
+			osce->on_exit_cb=&DupFD;
+			osce->user_data=who;
         } break;
         case 43: { // getegid
           // TODO wut is an egid
@@ -2540,10 +2571,17 @@ int main(int argc, const char *argv[], const char **env) {
         case 85: // swapon
           // no way
           break;
-        case 90:
-          goto defacto;
+        case 90: //dup2
+        {
+			uint64_t who=GetArg(0)|(GetArg(1)<<32);
+			COnSyscallExit *osce=FinishNormal();
+			osce->on_exit_cb=&DupFD2;
+			osce->user_data=who;
+		}
+		break;
         case 92: // fcntl
                  // NOT NOW
+                 //TODO
           break;
         case 93: // select
           break;
@@ -3229,22 +3267,19 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         case 574: // realpathat
         {
-          FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
+          //FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
           InterceptRealPathAt();
           break;
         }
-        case 785: { // closerange
+        
+        case 575: { // closerange
           CProcInfo *pinf = GetProcInfByPid(pid2);
           int a = GetArg(0);
           int b = GetArg(1);
-          int f = GetArg(2);
-          if (f & CLOSE_RANGE_CLOEXEC)
-            ; // Not relevant here
-          else
-            while (a < b) {
-              FDCacheRem(pinf->fd_cache, a++);
-            }
-            FinishNormal();
+          while (a < b) {
+            FDCacheRem(pinf->fd_cache, a++);
+          }
+          FinishNormal();
           break;
         }
         default:;
