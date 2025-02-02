@@ -52,6 +52,8 @@ char *FDCacheGet(CFDCache *c,int fd) {
 	if(fd<=0) return NULL;
 	if(fd>=1024) return NULL;
   if(fd<c->size) {
+	  if(c->values[fd]==FD_CACHE_NOT_FILE)
+		return NULL;
 	  return c->values[fd];
   }
   return NULL;

@@ -393,11 +393,13 @@ static int64_t FdToStr(char *to, int fd) {
   for (int i = 0; i < cnt; i++) {
 	  if(kfcur->kf_type==KF_TYPE_VNODE) {
 	    if(kfcur->kf_fd==fd) {
-			strcpy(to,kfcur->kf_path);
-            SetEnding(to,MC_UNCHROOTED_ENDING);
-            UnChrootPath(buf,to);
-			FDCacheSet(pinf->fd_cache, fd, buf);
-			break;
+			if(strlen(kfcur->kf_path)) {
+				strcpy(to,kfcur->kf_path);
+				SetEnding(to,MC_UNCHROOTED_ENDING);
+				UnChrootPath(buf,to);
+				FDCacheSet(pinf->fd_cache, fd, buf);
+				break;
+			}
 		}
 	  }
 	  kfcur=(char*)kfcur+kfcur->kf_structsize;
@@ -2878,25 +2880,29 @@ int main(int argc, const char *argv[], const char **env) {
           uid_t e = GetArg(1);
           uid_t s = GetArg(2);
           CProcInfo *pinf = GetProcInfByPid(pid2);
-          pinf->suid = s;
-          pinf->euid = e;
-          pinf->uid = u;
-          // TODO perms
+          if (pinf->uid == 0 || pinf->euid == 0) {
+          if(s!=-1) pinf->suid = s;
+          if(e!=-1) pinf->euid = e;
+          if(u!=-1) pinf->uid = u;
+		  SetSyscall(20);
           FakeSuccess();
+		  }
           break;
         }
         case 312: { // setresgid
           CProcInfo *pinf = GetProcInfByPid(pid2);
-          if (pinf->uid == 0 || pinf->uid == 0) {
+          if (pinf->uid == 0 || pinf->euid == 0) {
             uid_t u = GetArg(0);
             uid_t e = GetArg(1);
             uid_t s = GetArg(2);
+            SetSyscall(20);
             if (s != -1)
               pinf->sgid = s;
             if (u != -1)
               pinf->gid = u;
             if (e != -1)
               pinf->egid = e;
+			SetSyscall(20);
             FakeSuccess();
           } else {
 			  FinishFail(-EPERM);
@@ -2911,6 +2917,7 @@ int main(int argc, const char *argv[], const char **env) {
           PTraceWrite(mc_current_tid, up, &pinf->uid, sizeof(uid_t));
           PTraceWrite(mc_current_tid, ep, &pinf->euid, sizeof(uid_t));
           PTraceWrite(mc_current_tid, sp, &pinf->suid, sizeof(uid_t));
+          SetSyscall(20);
           FakeSuccess();
           break;
         }
@@ -2922,6 +2929,7 @@ int main(int argc, const char *argv[], const char **env) {
           PTraceWrite(mc_current_tid, up, &pinf->gid, sizeof(gid_t));
           PTraceWrite(mc_current_tid, ep, &pinf->egid, sizeof(gid_t));
           PTraceWrite(mc_current_tid, sp, &pinf->sgid, sizeof(gid_t));
+          SetSyscall(20);
           FakeSuccess();
           break;
         }
