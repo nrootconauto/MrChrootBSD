@@ -6,10 +6,10 @@
 
 static size_t ptracerw(int op, pid_t pid, void *buf, void *addr, size_t len) {
   struct ptrace_io_desc iod = {
-    .piod_op = op,
-    .piod_offs = addr,
-    .piod_addr = buf,
-    .piod_len = len,
+      .piod_op = op,
+      .piod_offs = addr,
+      .piod_addr = buf,
+      .piod_len = len,
   };
   ptrace(PT_IO, pid, (caddr_t)&iod, 0);
   return iod.piod_len;
