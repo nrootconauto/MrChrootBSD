@@ -34,6 +34,8 @@
   typedef struct x x;                                                          \
   struct x
 
+static struct __wrusage mc_current_usage;
+static siginfo_t mc_current_siginfo;
 CMountPoint mount_head, *root_mount;
 CChrootRoot chroot_root;
 class (CTidWait) {
@@ -44,6 +46,9 @@ class (CTidWait) {
 	int *write_code_to;
 	int wflags;
 	pid_t who;
+	int idtype;
+	struct __wrusage *usage;
+	struct siginfo_t *siginfo;
 } waiters;
 class (CWaitEvent) {
 	CWaitEvent *last,*next;
@@ -56,14 +61,18 @@ class (CWaitEvent) {
 	uid_t uid;
 	gid_t gid;
 	gid_t sid;
-	siginfo_t siginf;
+	struct __wrusage usage;
+	siginfo_t siginfo;
 } wait_events;
 #define PIF_PTRACE_FOLLOW_FORK 2
 #define PIF_PTRACE_LWP_EVENTS 4
+#define PIF_TO_SCX 8
 #define PIF_EXITED 32 
-#define PIF_TO_SCX_ONLY 64 
+#define PIF_TO_SCE 64 
 #define PIF_BORN 128
 #define PIF_FROZEN 256 //Dont run SCX or do anything on it,someone else (within MrChrootBSD) is ptracin
+#define PIF_DONE_WAITING 512
+#define PIF_SYSCALL 1024 //ptrace PT_SYSCALL 
 /*
  * 21 Nroot here
  * I will end Chrooted strings with "\00\01\02\00"
@@ -128,10 +137,13 @@ class (COnSyscallExit) {
 	int64_t tid;
 	char *restore1;
 	char *restore2;
+	char *restore3;
 	char *restore_ptr1;
 	char *restore_ptr2;
+	char *restore_ptr3;
 	int64_t restore_len1;
 	int64_t restore_len2;
+	int64_t restore_len3;
 	int64_t user_data; /* See notes in UpdateWait */
 	int64_t from_syscall; /* Only used with wait and freinds */
 	int64_t _use_args[6];
@@ -142,8 +154,8 @@ class (COnSyscallExit) {
 class (CPostSyscallExit) {
 	struct CPostSyscallExit *next;
 	void (*on_post_exit_cb)(struct CPostSyscallExit *);
-	int64_t tid;
 	char *user_data;
+	int64_t dont_remove;
 };
 //
 // Ditto 21
@@ -151,8 +163,8 @@ class (CPostSyscallExit) {
 class (CPostSyscallEnter) {
 	struct CPostSyscallEnter *next;
 	void (*on_post_enter_cb)(struct CPostSyscallEnter *);
-	int64_t tid;
 	char *user_data;
+	int64_t dont_remove;
 };
 
 class (CProcInfo) {
@@ -164,6 +176,7 @@ class (CProcInfo) {
   int ptrace_event_mask;
   struct ptrace_lwpinfo lwpinfo;
   int ngrps;
+  int saved_status;
   gid_t groups[NGROUPS_MAX+1];
   uid_t uid,suid,euid; //suid==saved gid,[g/s]etresuid 311/312
   gid_t gid,sgid,egid;
@@ -183,7 +196,7 @@ class (CProcInfo) {
 } proc_head;
 static int64_t ProcIsAlive(pid_t);
 static COnSyscallExit *AtSytle(char *, int64_t, int64_t);
-static void DelegatePtraceEvent(pid_t who, int code);
+static void DelegatePtraceEvent(pid_t who, int code,struct __wrusage *u,siginfo_t *si);
 static CProcInfo *GetProcInfByPid(pid_t pid);
 static int64_t GetProcCwd(char *to);
 static void RemoveProc(pid_t pid);
@@ -204,7 +217,7 @@ static int ptrace2(int a,pid_t p,void *add ,int d) {
 
 #define assert(f) if(!(f)) {fprintf(stderr,"Failure at " __FILE__  "(%d). Your on your own!!!\n",__LINE__); abort();}
 static pid_t mc_current_pid;
-static int mc_current_tid; //LWP id
+static int mc_current_tid,mc_current_wait_cond; //LWP id
 static void OnSyscallExitSetBackup1(COnSyscallExit *e,const char *to,char *a,int64_t l) {
 	if(e->restore1) abort();
 	e->restore1=calloc(1,l);
@@ -219,41 +232,56 @@ static void OnSyscallExitSetBackup2(COnSyscallExit *e,const char *to,char *a,int
 	e->restore_len2=l;
 	memcpy(e->restore2,a,l);
 }
-static void PT_SyscallExit() {
+static void OnSyscallExitSetBackup3(COnSyscallExit *e,const char *to,char *a,int64_t l) {
+	if(e->restore3) abort();
+	e->restore3=calloc(1,l);
+	e->restore_ptr3=to;
+	e->restore_len3=l;
+	memcpy(e->restore3,a,l);
+}
+static void PostSC() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	CPostSyscallEnter *pe;
 	struct ptrace_lwpinfo inf;
 	ptrace(PT_LWPINFO,mc_current_tid,&inf,sizeof(inf));
 	if(inf.pl_flags&PL_FLAG_SCE) {
+		CPostSyscallEnter *pe;
 		if(pe=pinf->sc_post_on_enter) {
-			pinf->sc_post_on_enter=pe->next;
 			if(pe->on_post_enter_cb)
 			  pe->on_post_enter_cb(pe);
-			free(pe);
+			if(!pe->dont_remove) {
+				pinf->sc_post_on_enter=pe->next;
+				free(pe);
+			}
 		}
 	}
-	if(!(pinf->flags&PIF_FROZEN))
+	if(inf.pl_flags&PL_FLAG_SCX) {
+		CPostSyscallExit *pe;
+		if(pe=pinf->sc_post_on_exit) {
+			if(pe->on_post_exit_cb)
+				pe->on_post_exit_cb(pe);
+			if(!pe->dont_remove) {
+				pinf->sc_post_on_exit=pe->next;
+				free(pe);
+			}
+		}
+	}
+}
+static void PT_SyscallExit() {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	PostSC();
+	if(!(pinf->flags&PIF_FROZEN)) {
 	  ptrace(PT_TO_SCX,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
+	}
 }
 static void PT_SyscallEnter() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	CPostSyscallExit *pe;
-	struct ptrace_lwpinfo inf;
-	ptrace(PT_LWPINFO,mc_current_tid,&inf,sizeof(inf));
-	if(inf.pl_flags&PL_FLAG_SCX) {
-		if(pe=pinf->sc_post_on_exit) {
-			pinf->sc_post_on_exit=pe->next;
-			if(pe->on_post_exit_cb)
-				pe->on_post_exit_cb(pe);
-			free(pe);
-		}
-	}
-	if(!(pinf->flags&PIF_FROZEN))
+	PostSC();
+	if(!(pinf->flags&PIF_FROZEN)) {
 	  ptrace(PT_TO_SCE,mc_current_tid,(caddr_t)1,NextKillSig(mc_current_pid));
+	 }
 }
 static COnSyscallExit *FinishFail(int64_t code) {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	PT_SyscallExit();
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=1;
 	sce->ret_code=code;
@@ -264,7 +292,6 @@ static COnSyscallExit *FinishFail(int64_t code) {
 }
 static COnSyscallExit *FinishPass1(int64_t code) {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	PT_SyscallExit();
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=0;
 	sce->ret_code=code;
@@ -277,7 +304,6 @@ static COnSyscallExit *FinishPass1(int64_t code) {
 }
 static COnSyscallExit *FinishPass0() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	PT_SyscallExit();
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->error=0;
 	sce->ret_code=0;
@@ -290,7 +316,6 @@ static COnSyscallExit *FinishPass0() {
 }
 static  COnSyscallExit *FinishNormal() {
 	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
-	PT_SyscallExit();
 	COnSyscallExit *sce=calloc(1,sizeof(COnSyscallExit));
 	sce->normal=1;
 	sce->tid=mc_current_tid;
@@ -550,6 +575,8 @@ static void OnSyscallExitDel(COnSyscallExit *g) {
     free(g->restore1);
   if (g->restore2)
     free(g->restore2);
+  if (g->restore3)
+    free(g->restore3);
   free(g);
 }
 static void PostSyscallExitDel(CPostSyscallExit *e) {
@@ -668,7 +695,66 @@ static int64_t IsChildProc(pid_t child, pid_t parent) {
     return 1;
   return IsChildProc(cinf->parent, parent);
 }
+static pid_t ToPid(pid_t pid) {
+	CProcInfo *pinf=proc_head.next;
+	pid_t tids[0x10000];
+	int tid_cnt;
+	for(;pinf!=&proc_head;pinf=pinf->next) {
+		if(pinf->pid==pid) {
+			return pid;
+		}
+	}
+	for(pinf=proc_head.next;pinf!=&proc_head;pinf=pinf->next) {
+		tid_cnt=ptrace(PT_GETNUMLWPS,pinf->pid,0,0);
+		tid_cnt=ptrace(PT_GETLWPLIST,pinf->pid,(caddr_t)&tids,tid_cnt*sizeof(pid_t));
+		while(--tid_cnt>=0) {
+			if(tids[tid_cnt]==pid) {
+				return pinf->pid;
+			}
+		}
+	}
+	return pid; //Man what
+}
+static void Freeze(pid_t pid) {
+	CProcInfo *pinf=GetProcInfByPid(ToPid(pid));
+	pinf->flags|=PIF_FROZEN;
+}
+static void UnFreesze(pid_t pid) {
+	CProcInfo *pinf=GetProcInfByPid(ToPid(pid));
+	pinf->flags&=~PIF_FROZEN;
+}
+static void FabricateSiginfoSIGCHLD(siginfo_t *si) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	memset(si,0,sizeof *si);
+	si->si_signo=SIGCHLD;
+	si->si_code=CLD_TRAPPED;
+	si->si_uid=pinf->uid;
+	si->si_pid=mc_current_pid;
+	si->si_status=SIGTRAP;
+}
+static void PtraceDumbSCE(CPostSyscallEnter *pe) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	siginfo_t si;
+	FabricateSiginfoSIGCHLD(&si);
+	if(pinf->debugged_by) {
+			kill(pinf->debugged_by,SIGCHLD);
+			DelegatePtraceEvent(mc_current_pid,_WSTOPPED|(SIGTRAP<<8),NULL,&si);
+			Freeze(mc_current_pid);
+	}
+}
+static void PtraceDumbSCX(CPostSyscallExit *pe) {
+	CProcInfo *pinf=GetProcInfByPid(mc_current_pid);
+	siginfo_t si;
+	FabricateSiginfoSIGCHLD(&si);
+	if(pinf->debugged_by) {
+			kill(pinf->debugged_by,SIGCHLD);
+			DelegatePtraceEvent(mc_current_pid,_WSTOPPED|(SIGTRAP<<8),NULL,&si);
+			Freeze(mc_current_pid);
+	}
+}
 static void InterceptPtrace() {
+  CPostSyscallEnter *pse;
+  CPostSyscallExit *psx;
   pid_t pid = mc_current_pid;
   int req = GetArg(0);
   pid_t who = GetArg(1);
@@ -685,6 +771,22 @@ static void InterceptPtrace() {
     pinf->ptrace_event_mask = PL_FLAG_EXEC;
     break;
   case PT_CONTINUE:
+continue_style:
+	SetSyscall(
+        20 // Run *getpid* instread of ptrace(dont run ptrace on ptrace)
+    );
+    //printf("COPNT:%d,%d\n",addr,data);
+    if(req==PT_KILL) {
+		ptrace(PT_KILL,who,addr,data);
+	} else if(req==PT_STEP)
+		ptrace(PT_STEP,who,addr,data);
+		else if(req==PT_SYSCALL)
+		ptrace(PT_SYSCALL,who,addr,data);
+	else 
+		ptrace(PT_TO_SCE,who,addr,data);
+		UnFreesze(who);
+    FinishPass0();
+    break;
   // cool beans
   // Dont allow child process to use its ptrace,use MrChrootBSD's ptrace
   case PT_READ_I:
@@ -719,7 +821,9 @@ static void InterceptPtrace() {
     goto intercept;
   }
   case PT_STEP:
+	goto continue_style;
   case PT_KILL:
+	goto continue_style;
   case PT_ATTACH:
   case PT_DETACH:
     goto use_host_ptrace;
@@ -749,13 +853,17 @@ static void InterceptPtrace() {
       data = sizeof(unsigned long);
     else if (req == PT_GETGSBASE)
       data = sizeof(unsigned long);
-    // Write nto poo poo tasks addres space
+    else if(req==PT_GETLWPLIST)
+		data = sizeof(struct ptrace_lwpinfo);
+    // Write into poo poo tasks addres space
     void *dumb = calloc(1, data + sizeof(struct ptrace_lwpinfo));
     ret = ptrace(req, who, dumb, data);
     if (ret == -1) {
       ret = -errno;
       failed = 1;
     }
+    if(req==PT_GETLWPLIST) {
+	}
     if (req == PT_LWPINFO) {
       struct ptrace_lwpinfo *inf = dumb;
       CProcInfo *dpinf = GetProcInfByPid(mc_current_pid);
@@ -772,11 +880,52 @@ static void InterceptPtrace() {
   case PT_SETSTEP:
   case PT_CLEARSTEP:
   case PT_SUSPEND:
-  case PT_RESUME:
-  case PT_TO_SCE:
-  case PT_TO_SCX:
-  case PT_SYSCALL:
+  
     goto use_host_ptrace;
+  case PT_RESUME:
+    ret=0;
+    failed=0;	
+	goto intercept;
+  case PT_SYSCALL:
+    pinf=GetProcInfByPid(mc_current_pid);
+    pinf->flags|=PIF_SYSCALL;
+    if(pinf->sc_post_on_exit||pinf->sc_post_on_enter) {
+		goto continue_style;
+	}
+    
+    psx=calloc(1,sizeof (CPostSyscallExit));
+    pinf = GetProcInfByPid(ToPid(who));
+    psx->next=pinf->sc_post_on_exit;
+    pinf->sc_post_on_exit=psx;
+    psx->on_post_exit_cb=&PtraceDumbSCX;
+	psx->dont_remove=1;
+	
+	pse=calloc(1,sizeof (CPostSyscallEnter));
+    pinf = GetProcInfByPid(ToPid(who));
+    pse->next=pinf->sc_post_on_enter;
+    pinf->sc_post_on_enter=pse;
+    pse->on_post_enter_cb=&PtraceDumbSCE;
+	pse->dont_remove=1;
+	
+    goto continue_style;
+  case PT_TO_SCE:
+    pse=calloc(1,sizeof (CPostSyscallEnter));
+    pinf = GetProcInfByPid(ToPid(who));
+    pse->next=pinf->sc_post_on_enter;
+    pinf->sc_post_on_exit=pse;
+    pse->on_post_enter_cb=&PtraceDumbSCE;
+    pinf->flags|=PIF_TO_SCE;
+    FinishPass0();
+	break;
+  case PT_TO_SCX:
+    psx=calloc(1,sizeof (CPostSyscallExit));
+    pinf = GetProcInfByPid(ToPid(who));
+    psx->next=pinf->sc_post_on_exit;
+    pinf->sc_post_on_exit=psx;
+    psx->on_post_exit_cb=&PtraceDumbSCX;
+    pinf->flags|=PIF_TO_SCX;
+    FinishPass0();
+	break;
   case PT_GET_SC_ARGS:
   case PT_GET_SC_RET:
     goto read_style;
@@ -792,10 +941,10 @@ static void InterceptPtrace() {
   // case PT_GETXSTATE_INFO:
   // case PT_SETXMMREGS:
   case PT_SETXSTATE:
-  case PT_SETREGS:
   case PT_SETFPREGS:
   case PT_SETDBREGS:
   case PT_SETGSBASE:
+  case PT_SETREGS:
   case PT_SETFSBASE: {
   write_style:;
     if (req == PT_SETREGS)
@@ -882,13 +1031,14 @@ static CWaitEvent *EventForWait(pid_t pid, pid_t who, int _idtype) {
           return wev;
       }
       if (who == 0 && is_parent) {
-        if (getpgid(wev->from) == getpgid(pid))
+        if (getpgid(wev->from) == getpgid(pid)) {
           return wev;
+        }
       }
     }
     if (_idtype == P_PID) {
       if (wev->from == who && is_parent)
-        return wev;
+        return wev;	
     }
     if (_idtype == P_PGID) {
       if (getpgid(wev->from) == who && is_parent)
@@ -924,6 +1074,7 @@ static void *SCRemoteNoBlock(void *s) {
 }
 static void UpdateWait(COnSyscallExit *un) {
   char use_delegated = 1;
+  COnSyscallExit *osce;
   CProcInfo *cur, *cur2;
   CTidWait *waiter, *next_waiter;
   CWaitEvent *wev;
@@ -931,6 +1082,7 @@ static void UpdateWait(COnSyscallExit *un) {
   int64_t args4[4];
   int tid, pass;
   char failed, interupt;
+  CProcInfo *pinf;
   struct ptrace_lwpinfo inf;
   ptrace(PT_LWPINFO, mc_current_tid, (caddr_t)&inf, sizeof inf);
   for (waiter = waiters.next; waiter != &waiters; waiter = next_waiter) {
@@ -944,20 +1096,31 @@ static void UpdateWait(COnSyscallExit *un) {
     wflags = waiter->wflags;
     who = waiter->who;
   wait4:;
-    if (wev = EventForWait(cur->pid, who, 0)) {
-      PTraceWriteBytes(write_code_to, &wev->code, sizeof(int));
-      FinishPass1(wev->from);
+    if (wev = EventForWait(cur->pid, who, waiter->idtype)) {
+      osce=FinishPass1(wev->from);
+      if(write_code_to)
+          OnSyscallExitSetBackup2(osce, write_code_to, &wev->code, sizeof(int));
+      if(waiter->siginfo)
+		    OnSyscallExitSetBackup3(osce, waiter->siginfo, &wev->siginfo, sizeof(struct __wrusage));
+      if(waiter->usage)
+		    OnSyscallExitSetBackup1(osce, waiter->usage, &wev->usage, sizeof(siginfo_t));
+	  pinf=GetProcInfByPid(mc_current_pid);
+	  pinf->flags|=PIF_DONE_WAITING;
       pass = 1;
       goto next;
     }
     if (!HasChildren(cur->pid)) {
       FinishFail(-ECHILD);
+      pinf=GetProcInfByPid(mc_current_pid);
+	  pinf->flags|=PIF_DONE_WAITING;
       goto remove_waiter;
     }
     // if WNOHANG was set,return as usale
     if (wflags & WNOHANG) {
       pass = 1;
       FinishPass1(0);
+      pinf=GetProcInfByPid(mc_current_pid);
+	  pinf->flags|=PIF_DONE_WAITING;
       goto next;
     }
   next:;
@@ -973,7 +1136,7 @@ static void UpdateWait(COnSyscallExit *un) {
   }
 real:;
 }
-static void DelegatePtraceEvent(pid_t who, int code) {
+static void DelegatePtraceEvent(pid_t who, int code,struct __wrusage *u,siginfo_t *si) {
   if (who) {
     CWaitEvent *ev = calloc(1, sizeof(CWaitEvent)), *tmp;
     CProcInfo *inf = GetProcInfByPid(who);
@@ -987,6 +1150,10 @@ static void DelegatePtraceEvent(pid_t who, int code) {
     ev->next = &wait_events;
     ev->next->last = ev;
     ev->last->next = ev;
+    if(u)
+		ev->usage=*u;
+    if(si)
+		ev->siginfo=*si;
   }
   pid_t oldp = mc_current_pid, oldt = mc_current_tid;
   CTidWait *cur;
@@ -999,9 +1166,8 @@ static void DelegatePtraceEvent(pid_t who, int code) {
   mc_current_tid = oldt;
 }
 // Returns 1 if unpaused,else 0
-static int InterceptWait(int who, int *write_to, int wflags) {
+static int InterceptWait(int six,int who, int *write_to, int wflags,struct __wrusage *usage,siginfo_t *si) {
   CProcInfo *inf = GetProcInfByPid(mc_current_pid);
-  int64_t a3 = GetArg(3);
   CTidWait *waiter = calloc(1, sizeof(CTidWait));
   waiter->tid = mc_current_tid;
   waiter->pid = mc_current_pid;
@@ -1012,13 +1178,20 @@ static int InterceptWait(int who, int *write_to, int wflags) {
   else
     waiter->write_code_to = GetHackDataAreaForPid(who);
   waiter->who = who;
+  waiter->usage=usage;
+  waiter->siginfo=si;
 
   waiter->next = waiters.next;
   waiter->last = &waiters;
   waiter->last->next = waiter;
   waiter->next->last = waiter;
+  waiter->idtype=0;
 
-  SetArg(2, wflags | WNOHANG);
+  if(six==6) {
+	SetArg(3, wflags | WNOHANG);
+	waiter->idtype=GetArg(0);
+  } else
+	SetArg(2, wflags | WNOHANG);
   UpdateWait(NULL);
   return 0;
 }
@@ -1298,7 +1471,6 @@ static int HasPerms(int af, char *path_) {
     }
   }
   if (e = HashTableGet(&dummy, uc)) {
-    // printf("%s,%o",uc,e->perms);
     // Try use
     if (e->uid == inf->uid) {
       masked = (e->perms >> 6) & 0b111;
@@ -1516,7 +1688,7 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    //    waitpid(mc_current_pid, NULL, 0);
+    waitpid(mc_current_tid, NULL, 0);
   } else {
     char extra_arg_strs[1024][256];
     // fexecve(open("interrepret name"),argv,env)
@@ -1592,7 +1764,7 @@ static void InterceptExecve() {
     if (is_set_gid)
       pinf->egid = FileGid(have_str);
     ptrace(PT_SC_REMOTE, mc_current_tid, (caddr_t)&rmt, sizeof rmt);
-    //    waitpid(mc_current_pid, NULL, 0);
+    waitpid(mc_current_tid,NULL,0);
   }
   if (perms & S_ISUID) {
     pinf->euid = FileUid(have_str);
@@ -2130,6 +2302,33 @@ static void TheEnd() {
   }
   HashTableDone();
 }
+static int Wait(int *status,struct __wrusage *usage, siginfo_t *info) {
+again:;
+	CProcInfo *pinf=proc_head.next;
+			struct ptrace_lwpinfo inf;
+			int ofroozen;
+	while(pinf!=&proc_head) {
+		if(pinf->flags&PIF_DONE_WAITING&&pinf->sc_on_exit) {
+			pinf->flags&=~PIF_DONE_WAITING;
+			if(status) *status=pinf->saved_status;
+			//At syscall enter
+			mc_current_pid=pinf->pid;
+			mc_current_tid=pinf->sc_on_exit->tid; //TODO whoops
+			ofroozen=pinf->flags&PIF_FROZEN;
+			ptrace(PT_LWPINFO,mc_current_tid,(caddr_t)&inf,sizeof inf);
+			pinf->flags&=~PIF_FROZEN;
+			PT_SyscallExit();
+			pinf->flags|=ofroozen;
+			goto again;
+		}
+		pinf=pinf->next;
+	}
+w:;
+	pid_t poo=wait6(P_ALL,-1,status,WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
+                               WCONTINUED,usage,info);
+                   
+    return poo;
+}
 int main(int argc, const char *argv[], const char **env) {
   signal(SIGHUP, SIG_IGN);
   pid_t pid, pid2;
@@ -2219,9 +2418,9 @@ int main(int argc, const char *argv[], const char **env) {
     pinf0->groups[0] = 0; // Wheel
     pinf0->chrooted_at = ChrootAt("/");
     pinf0->login = strdup("root");
-    while ((pid2 = waitpid(-1, &cond,
-                           WUNTRACED | WEXITED | WTRAPPED | WSTOPPED |
-                               WCONTINUED))) {
+    while ((pid2 = Wait(&cond,
+                               &mc_current_usage,&mc_current_siginfo
+                           ))) {
       if ((WIFSIGNALED(cond) || WIFEXITED(cond)) && pid2 == pid) {
         struct procctl_reaper_kill rkill = {0};
         rkill.rk_sig = SIGKILL;
@@ -2231,6 +2430,7 @@ int main(int argc, const char *argv[], const char **env) {
       }
       struct ptrace_lwpinfo inf;
       CProcInfo *pinf = GetProcInfByPid(pid2);
+      pinf->saved_status=cond;
       ptrace(PT_LWPINFO, pid2, (caddr_t)&inf, sizeof inf);
 
       /* 21 Nroot here,I have mc_current_pid/mc_current_tid
@@ -2239,24 +2439,7 @@ int main(int argc, const char *argv[], const char **env) {
        */
       mc_current_pid = pid2;
       mc_current_tid = inf.pl_lwpid;
-      if (WIFEXITED(cond)) {
-        DelegatePtraceEvent(pid2, cond);
-        pid_t par = pinf->parent;
-        pinf->flags |= PIF_EXITED;
-        kill	(pinf->parent, SIGCHLD);
-        RemoveProc(pid2);
-        continue;
-      } else if (WIFSIGNALED(cond)) {
-        if (1) {
-          DelegatePtraceEvent(pid2, cond);
-          if (pinf->debugged_by) {
-          } else {
-            ptrace(PT_CONTINUE, pid2, (void *)1, WTERMSIG(cond));
-            RemoveProc(pid2);
-          }
-          continue;
-        }
-      }
+      mc_current_wait_cond=cond;
       // Nested ptrace,delegate poo poo sauce to the "simulated" ptrace if
       // we are being debugged;
       {
@@ -2265,22 +2448,44 @@ int main(int argc, const char *argv[], const char **env) {
           pid_t to = pinf->debugged_by;
           if (!to)
             to = pinf->parent;
-          if (pinf->flags & PIF_BORN) {
-            inf.pl_flags = PL_FLAG_BORN | PL_FLAG_EXEC;
-          }
-          if ((pinf->ptrace_event_mask & inf.pl_flags)) {
-			  if((pinf->ptrace_event_mask&inf.pl_flags)&(PL_FLAG_SCE|PL_FLAG_SCX))
-				goto normal;
-            kill(to, SIGCHLD);
+          int antipode=~0;
+          int esce=(pinf->flags&PIF_TO_SCE)?1:0;
+		  int escx=(pinf->flags&PIF_TO_SCX)?1:0;
+	      if(!esce&&!(pinf->flags&PIF_SYSCALL))
+			antipode&=~PL_FLAG_SCE;
+          if(!escx&&!(pinf->flags&PIF_SYSCALL))
+			antipode&=~PL_FLAG_SCX;
+          if ((pinf->ptrace_event_mask & inf.pl_flags&antipode)) {
           send_out:;
-            DelegatePtraceEvent(pid2, cond);
+            kill(to,SIGCHLD);
+            DelegatePtraceEvent(pid2, cond,&mc_current_usage,&mc_current_siginfo);
             // Heres the DEAL.PT_TRACE_ME sets the PTRACE_EXEC flag in the
             // ptrace state(not reset when used)
             continue;
           }
         }
       }
-    normal:
+    normal:;
+    if (WIFEXITED(cond)) {
+        kill	(pinf->parent, SIGCHLD);
+        DelegatePtraceEvent(pid2, cond,&mc_current_usage,&mc_current_siginfo);
+        pid_t par = pinf->parent;
+        pinf->flags |= PIF_EXITED;
+        RemoveProc(pid2);
+        continue;
+      } else if (WIFSIGNALED(cond)) {
+        if (1) {
+          puts("l2");
+          DelegatePtraceEvent(pid2, cond,&mc_current_usage,&mc_current_siginfo);
+          if (pinf->debugged_by) {
+          } else {
+            ptrace(PT_CONTINUE, pid2, (void *)1, WTERMSIG(cond));
+            RemoveProc(pid2);
+          }
+          continue;
+        }
+      }
+      
       if (inf.pl_flags & PL_FLAG_SCX) {
         COnSyscallExit **write_to = &pinf->sc_on_exit, *have = pinf->sc_on_exit;
         while (have) {
@@ -2298,6 +2503,14 @@ int main(int argc, const char *argv[], const char **env) {
               PTraceWriteBytes(have->restore_ptr2, have->restore2,
                                have->restore_len2);
               free(have->restore2);
+            }
+            if (have->restore3) {
+              if (have->restore_len3 == sizeof(struct stat)) {
+                struct stat *st = have->restore3;
+              }
+              PTraceWriteBytes(have->restore_ptr3, have->restore3,
+                               have->restore_len3);
+              free(have->restore3);
             }
             if (!have->normal)
               SetReturn(have->ret_code, have->error);
@@ -2317,8 +2530,7 @@ int main(int argc, const char *argv[], const char **env) {
       }
       if (inf.pl_flags & PL_FLAG_EXITED) {
         // DelegatePtraceEvent
-        PT_SyscallEnter();
-        continue;
+        goto syscall;
       }
       if (inf.pl_flags & PL_FLAG_EXITED) {
         pinf->flags |= PIF_EXITED;
@@ -2328,8 +2540,7 @@ int main(int argc, const char *argv[], const char **env) {
         pinf->flags &= ~PIF_EXITED;
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
         ptrace(PT_LWP_EVENTS, mc_current_tid, NULL, 1);
-        PT_SyscallEnter();
-        continue;
+        goto syscall;
       } else if (inf.pl_flags &
                  (PL_FLAG_FORKED | PL_FLAG_VFORKED | PL_FLAG_VFORK_DONE)) {
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
@@ -2354,13 +2565,11 @@ int main(int argc, const char *argv[], const char **env) {
         memcpy(child->groups, parent->groups, child->ngrps * sizeof(gid_t));
         // Born again?
         parent->flags &= ~PIF_EXITED;
-        PT_SyscallEnter();
-        continue;
+        goto syscall;
       } else if (inf.pl_flags & PL_FLAG_CHILD) {
         ptrace(PT_FOLLOW_FORK, mc_current_tid, NULL, 1);
         ptrace(PT_LWP_EVENTS, mc_current_tid, (void *)1, 0);
-        PT_SyscallEnter();
-        continue;
+        goto syscall;
       } else if (inf.pl_flags & PL_FLAG_SCE) {
         // fprintf(stderr,"%d,%d\n",pid2,inf.pl_syscall_code);
         switch (inf.pl_syscall_code) {
@@ -2379,15 +2588,15 @@ int main(int argc, const char *argv[], const char **env) {
           FinishNormal();
         } break;
         case 0: // syscall
-          break;
+          goto defacto;
         case 1: // exit
-          break;
+          goto defacto;
         case 2: // fork
-          break;
+          goto defacto;
         case 3: // read
-          break;
+          goto defacto;
         case 4: // write
-          break;
+          goto defacto;
         case 5: { // open
           int af = 0;
           int64_t want_ = GetArg(1);
@@ -2419,14 +2628,14 @@ int main(int argc, const char *argv[], const char **env) {
         case 7: { // wait4
           pid_t want = GetArg(0);
           int f = GetArg(2);
-          InterceptWait(want, (int *)GetArg(1), f);
+          InterceptWait(0,want, (int *)GetArg(1), f,NULL,NULL);
           continue;
           break;
         }
         case 532: { // wait6
           pid_t want = GetArg(1);
           SetArg(1, -1); // Wait for self(we will interupt later)
-          InterceptWait(want, (int *)GetArg(2), GetArg(3));
+          InterceptWait(6,want, (int *)GetArg(2), GetArg(3),(void*)GetArg(4),(void*)GetArg(5));
           continue;
           break;
         }
@@ -2458,7 +2667,7 @@ int main(int argc, const char *argv[], const char **env) {
           FakeSuccess();
           break;
         case 20: // getpid
-          break;
+          goto defacto;
         case 21: // mount
           InterceptMount();
           break;
@@ -2490,8 +2699,8 @@ int main(int argc, const char *argv[], const char **env) {
            * */
           FPERMCHECK(W_OK | F_OK, 0);
           FinishNormal();
-        } break;
-          break;
+        }
+        break;
         case 37: { // kill
           /* 21 Nrootcomauto here,Ask nrootconauto to implement(and) killing
            *other procs (TODO handle p<=0)
@@ -2540,7 +2749,7 @@ int main(int argc, const char *argv[], const char **env) {
           }
         } break;
         case 39: // getppid TODO
-          break;
+          goto defacto;
         case 41: { // dup
           int64_t who = GetArg(0);
           COnSyscallExit *osce = FinishNormal();
@@ -2584,7 +2793,7 @@ int main(int argc, const char *argv[], const char **env) {
           FinishPass0();
         }
         case 54: // ioctl
-          break;
+          goto defacto;
         case 56: { // revoke
           PERMCHECK(W_OK | F_OK, 0);
           INTERCEPT_FILE1(0);
@@ -2606,6 +2815,7 @@ int main(int argc, const char *argv[], const char **env) {
         case 59: { // execve
           PERMCHECK(X_OK | F_OK, 0);
           InterceptExecve();
+          goto next;
         } break;
         case 61: { // chroot TODO
           CProcInfo *pinf = GetProcInfByPid(pid2);
@@ -2623,11 +2833,11 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         }
         case 66: // vfork
-          break;
+          goto defacto;
         case 73: // munmap
-          break;
+          goto defacto;
         case 74: // mprotect
-          break;
+          goto defacto;
         case 79: // getgroups
         {
           CProcInfo *pinf = GetProcInfByPid(pid2);
@@ -2658,15 +2868,15 @@ int main(int argc, const char *argv[], const char **env) {
         } break;
         case 81: // getpgrp TODO
                  // Ask a kevalin
-          break;
+          goto defacto;
         case 82: // setpgid TODO
                  // You'll need to do some digging
-          break;
+          goto defacto;
         case 83: // setitimer
-          break;
+          goto defacto;
         case 85: // swapon
           // no way
-          break;
+          goto defacto;
         case 90: // dup2
         {
           uint64_t who = GetArg(0) | (GetArg(1) << 32);
@@ -2677,9 +2887,9 @@ int main(int argc, const char *argv[], const char **env) {
         case 92: // fcntl
                  // NOT NOW
                  // TODO
-          break;
+          goto defacto;
         case 93: // select
-          break;
+          goto defacto;
         case 15: // chmod
           PERMCHECK(W_OK, 0);
           InterceptChmod();
@@ -2709,7 +2919,7 @@ int main(int argc, const char *argv[], const char **env) {
           /*
            * Ask nroot,he will add it. I dont think anyone will notice for now
            */
-          break;
+          goto defacto;
         }
         case 123: { // fchown
           FPERMCHECK(F_OK | W_OK, 0);
@@ -2806,7 +3016,7 @@ int main(int argc, const char *argv[], const char **env) {
         } break;
         case 131: // flock
         {
-          break;
+          goto defacto;
         }
         case 132: { // mkfifo
           char dst[1024], failed;
@@ -2838,7 +3048,7 @@ int main(int argc, const char *argv[], const char **env) {
           INTERCEPT_FILE1(0);
         } break;
         case 147: // setsid TODO?
-          break;
+          goto defacto;
         case 148: { // qoutactl
           INTERCEPT_FILE1(0);
         } break;
@@ -2849,7 +3059,7 @@ int main(int argc, const char *argv[], const char **env) {
           INTERCEPT_FILE1(0);
         } break;
         case 165: // sysarch
-          break;
+          goto defacto;
         case 181: { // setgid
         setgid:;
           /* 21 Nroot here
@@ -2964,9 +3174,9 @@ int main(int argc, const char *argv[], const char **env) {
           /* 21 Nroot
            *   Stay tuned.
            */
-          break;
+          goto defacto;
         case 340: // sigprocmask
-          break;
+          goto defacto;
         case 311: { // setresuid
           uid_t u = GetArg(0);
           uid_t e = GetArg(1);
@@ -3083,17 +3293,17 @@ int main(int argc, const char *argv[], const char **env) {
           INTERCEPT_FILE1(0);
         } break;
         case 416: // sigaction
-          break;
+          goto defacto;
         case 417: // sigreturn
-          break;
+          goto defacto;
         case 436: // jail_attach
-          break;
+          goto defacto;
         case 475: // pread
-          break;
+          goto defacto;
         case 476: // pwrite
-          break;
+          goto defacto;
         case 477: { // mmap
-        } break;
+        } goto defacto;
         case 479: // truncate
           PERMCHECK(W_OK | F_OK, 0);
           InterceptAccessTruncate();
@@ -3313,7 +3523,7 @@ int main(int argc, const char *argv[], const char **env) {
           break;
         }
         case 544: { // procctl
-          break;
+          goto defacto;
         }
         case 546: // futimes
           FPERMCHECK(W_OK, 0);
@@ -3332,23 +3542,22 @@ int main(int argc, const char *argv[], const char **env) {
           InterceptFstatat();
         } break;
         case 553:
-          break;
+          goto defacto;
         case 554: // getdirentries
           // Filename is from fd
-          break;
+          goto defacto;
         case 540: // chflagsat
           FATPERMCHECK(NULL, W_OK | F_OK, 0, 1);
           AtSytle(NULL, 0, 1);
           break;
-          break;
         case 556: // fstatfs
-          break;
+          goto defacto;
         case 559: { // mknodat
                     // Only super uses can make nodes
                     // AtSytle(NULL, pid2, 0, 1);
-        } break;
+        } goto defacto;
         case 563: // getrandom
-          break;
+          goto defacto;
 
         case 564: { // getfhat
           FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
@@ -3373,7 +3582,7 @@ int main(int argc, const char *argv[], const char **env) {
           InterceptShmRename();
           break;
         case 573: // sigfastblock
-          break;
+          goto defacto;
         case 574: // realpathat
         {
           // FATPERMCHECK(NULL, R_OK | F_OK, 0, 1);
@@ -3398,13 +3607,22 @@ int main(int argc, const char *argv[], const char **env) {
       defacto:;
         if (WIFSTOPPED(cond)) {
           if (WSTOPSIG(cond) == SIGTRAP) {
-            goto norm;
+            if(inf.pl_flags&(PL_FLAG_SCE|PL_FLAG_SCX)) {
+				goto norm;
+			}
           }
           ptrace(PT_TO_SCX,pid2,(caddr_t)1,WSTOPSIG(cond));
-          DelegatePtraceEvent(pid2, cond);
+          
+          DelegatePtraceEvent(pid2, cond,&mc_current_usage,&mc_current_siginfo);
+          continue;
         }
       norm:
-        PT_SyscallEnter();
+      syscall:;
+        if(inf.pl_flags&PL_FLAG_SCE) {
+          PT_SyscallExit();
+        } else {
+          PT_SyscallEnter();
+        }
       }
     next:;
     }
